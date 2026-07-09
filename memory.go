@@ -17,6 +17,7 @@ type groupState struct {
 	gpus                []int
 	measuredTotalVRAMMB int64 // from nvidia-smi at startup
 	measuredFreeMB      int64 // actual free VRAM from nvidia-smi; -1 until first refreshMemory call
+	pendingVRAMMB       int64 // sum of reservedVRAMMB for all models currently in stateLoading on this group
 }
 
 // memoryState holds all VRAM and CPU RAM accounting.

@@ -66,6 +66,9 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	}
 
 	me.reservedVRAMMB = needed
+	o.ms.mu.Lock()
+	o.ms.groups[idx].pendingVRAMMB += needed
+	o.ms.mu.Unlock()
 	return idx, nil
 }
 
@@ -75,7 +78,7 @@ func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
 	best := -1
 	var bestTotal int64
 	for i, gs := range o.ms.groups {
-		if gs.measuredFreeMB >= neededMB {
+		if gs.measuredFreeMB-gs.pendingVRAMMB >= neededMB {
 			if best < 0 || gs.measuredTotalVRAMMB < bestTotal {
 				best = i
 				bestTotal = gs.measuredTotalVRAMMB
@@ -141,9 +144,10 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		refreshMemory(o.ms)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
+		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
 		log.Printf("[scheduler] rule1: free %dMB → %dMB  %s  ACTIVE → SLEEP1", freeBefore, free, me.cfg.Name)
-		if free >= neededMB {
+		if free-pending >= neededMB {
 			return true
 		}
 	}
@@ -170,9 +174,10 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		waitVRAMStable(o.ms, gs)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
+		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
 		log.Printf("[scheduler] rule2: free %dMB → %dMB  %s  SLEEP2 → UNLOADED", freeBefore, free, me.cfg.Name)
-		if free >= neededMB {
+		if free-pending >= neededMB {
 			return true
 		}
 	}
@@ -202,9 +207,10 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		refreshMemory(o.ms)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
+		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
 		log.Printf("[scheduler] rule3: free %dMB → %dMB  %s  SLEEP1 → SLEEP2", freeBefore, free, me.cfg.Name)
-		if free >= neededMB {
+		if free-pending >= neededMB {
 			return true
 		}
 	}
@@ -231,9 +237,10 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		waitVRAMStable(o.ms, gs)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
+		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
 		log.Printf("[scheduler] rule4: free %dMB → %dMB  %s  SLEEP2 → UNLOADED", freeBefore, free, me.cfg.Name)
-		if free >= neededMB {
+		if free-pending >= neededMB {
 			return true
 		}
 	}
