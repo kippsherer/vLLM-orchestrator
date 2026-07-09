@@ -1,6 +1,6 @@
 # Plan: vLLM Orchestrator in Go
 
-**Date**: 2026-07-09 (revised 2)
+**Date**: 2026-07-09 (revised 3)
 **Module**: `github.com/kippsherer/vLLM-orchestrator`
 **Goal**: Model-on-demand vLLM process lifecycle manager with a transparent pass-through reverse proxy. Not an API gateway — every byte of every request is forwarded to vLLM unmodified.
 
@@ -31,9 +31,11 @@ Config is a single YAML file (path provided via `--config` flag or `VLLM_ORCH_CO
 ```yaml
 listen: ":8000"               # orchestrator bind address; mirrors vLLM's default port
 vllm_socket_dir: "/run/vllm"  # directory where per-model Unix socket files are created
+queue_depth: 100              # max queued requests per model before 503 is returned
 
-ttl_active: 10m               # idle TTL while ACTIVE → transition to SLEEP1
-ttl_inactive: 60m             # idle TTL while SLEEP1 → transition to UNLOADED
+ttl_active: 10m               # idle TTL: ACTIVE → SLEEP1 (resets on each completed request)
+ttl_inactive: 60m             # idle TTL: SLEEP1 → SLEEP2
+ttl_unused: 120m              # idle TTL: SLEEP2 → UNLOADED (process terminated)
 
 gpu_groups:
   - id: "group0"
@@ -72,10 +74,10 @@ models:
 Each model has exactly one of these states at any moment:
 
 ```
-UNLOADED ──request──► LOADING ──ready──► ACTIVE ──ttl_active──► SLEEP1 ──ttl_inactive──► UNLOADED
-                                           ▲          │
-                                           └──request─┘
-                                           └──request (from SLEEP1)──────────────────────┘
+UNLOADED ──request──► LOADING ──ready──► ACTIVE ──ttl_active──► SLEEP1 ──ttl_inactive──► SLEEP2 ──ttl_unused──► UNLOADED
+                                           ▲          │              ▲            │
+                                           └──request─┘              └──request───┘
+                                           └──request (from SLEEP2)──────────────────────────────────────────────────┘
 ```
 
 | State | Description | VRAM held | CPU RAM held | vLLM process |
@@ -84,22 +86,25 @@ UNLOADED ──request──► LOADING ──ready──► ACTIVE ──ttl_ac
 | `LOADING` | Process starting, measuring memory, not yet ready | reserved (see §10) | 0 | Starting |
 | `ACTIVE` | Serving requests | `full_kv_vram_mb` | 0 | Running, GPU active |
 | `SLEEP1` | Weights offloaded to CPU via `POST /sleep?level=1` | 0 | `weights_vram_mb` | Running, GPU freed |
+| `SLEEP2` | All GPU memory discarded via `POST /sleep?level=2` | 0 | 0 | Running, fully suspended |
 
-**Why only three operational states:**
-- **SLEEP1** uses vLLM's native `POST /sleep?level=1` — offloads model weights from GPU VRAM to CPU host RAM. The vLLM process stays alive. GPU VRAM is fully released. Resuming calls `POST /wake_up` on the same process — no restart needed, warm resume.
-- **SLEEP2 and UNLOADED are merged**: `sleep(level=2)` discards all GPU memory but keeps the process alive with no CPU RAM benefit worth preserving (weights must be reloaded from disk on `wake_up` regardless). SLEEP2 is not used — instead the process is terminated (UNLOADED). Resuming always re-launches vLLM from disk.
-- Two resume paths: warm (SLEEP1 → ACTIVE via `POST /wake_up`) and cold (UNLOADED → LOADING → ACTIVE via new process).
+**State descriptions:**
+- **SLEEP1** uses vLLM's native `POST /sleep?level=1` — offloads model weights from GPU VRAM to CPU host RAM. GPU VRAM fully released. Warm resume via `POST /wake_up`.
+- **SLEEP2** uses vLLM's native `POST /sleep?level=2` — discards all GPU memory. No CPU RAM held. The vLLM process remains alive but fully suspended; weights must reload from disk on `wake_up`. Resume is slower than SLEEP1 but faster than a full process restart (process overhead already paid).
+- **UNLOADED** — process terminated. `ttl_unused` elapsed in SLEEP2, or explicitly killed. Full cold start on next request.
 
 **Transition triggers:**
 - `UNLOADED → LOADING`: incoming request for this model
-- `LOADING → ACTIVE`: `GET /health` returns 200 AND memory values successfully measured from startup logs
+- `LOADING → ACTIVE`: `GET /health` returns 200 AND memory values measured from startup logs
 - `ACTIVE → SLEEP1`: `active_request_count == 0` AND `ttl_active` elapses AND `free_cpu_ram_mb >= weights_vram_mb`
-- `ACTIVE → UNLOADED`: `ttl_active` elapses AND insufficient CPU RAM for SLEEP1 — terminate directly
+- `ACTIVE → SLEEP2`: `active_request_count == 0` AND `ttl_active` elapses AND insufficient CPU RAM for SLEEP1
 - `SLEEP1 → ACTIVE`: incoming request → `POST /wake_up` → poll `GET /is_sleeping` until false
-- `SLEEP1 → UNLOADED`: `active_request_count == 0` AND `ttl_inactive` elapses → terminate process
+- `SLEEP1 → SLEEP2`: `active_request_count == 0` AND `ttl_inactive` elapses
+- `SLEEP2 → ACTIVE`: incoming request → `POST /wake_up` → poll `GET /is_sleeping` until false
+- `SLEEP2 → UNLOADED`: `active_request_count == 0` AND `ttl_unused` elapses → terminate process
 - Any state → `UNLOADED`: process exits unexpectedly (crash)
 
-**The TTL clock resets** on every successfully forwarded response for that model.
+**The TTL clock resets** on every successfully forwarded response for that model. TTL timers are per-model and fire independently based solely on that model's own idle time. Displacement of other models when memory is needed is handled by the freeing memory rules (§6), not by TTL suppression.
 
 **Sleep endpoint availability:** vLLM's `/sleep`, `/wake_up`, and `/is_sleeping` endpoints require `VLLM_SERVER_DEV_MODE=1`. The orchestrator always sets this env var when launching vLLM subprocesses.
 
@@ -176,19 +181,25 @@ group.free_vram_mb = group.measured_total_vram_mb
 
 Applied **per GPU group** individually, only when a group has insufficient `free_vram_mb` to load a requested model. Within each rule, models are processed **smallest first** (by `full_kv_vram_mb`). Models with in-flight requests are never touched.
 
-**Rule 1 — Move ACTIVE → SLEEP1 (if CPU RAM allows)**
-- For each idle ACTIVE model on the group (smallest first): if `free_cpu_ram_mb >= model.weights_vram_mb`, call `POST /sleep?level=1`, poll `GET /is_sleeping` until true, update VRAM and CPU RAM accounting.
+**Rule 1 — Move ACTIVE → SLEEP1 (if CPU RAM allows; if not, run Rule 2 first to free CPU RAM)**
+- For each idle ACTIVE model on the group (smallest first):
+  - If `free_cpu_ram_mb >= model.weights_vram_mb`: call `POST /sleep?level=1`, poll `GET /is_sleeping` until true, update VRAM and CPU RAM accounting.
+  - If CPU RAM is insufficient: run Rule 2 targeting CPU RAM (terminate SLEEP2 processes) until enough CPU RAM is freed, then retry SLEEP1 for this model.
 - Stop as soon as the group has enough free VRAM for the target model.
 
-**Rule 2 — Terminate SLEEP1 processes**
-- For each SLEEP1 model on the group (smallest first): send `SIGTERM` (SIGKILL after 30s), release `weights_vram_mb` from CPU RAM accounting, mark `UNLOADED`.
-- Stop as soon as enough memory is freed.
+**Rule 2 — Terminate SLEEP2 processes (frees both VRAM reservation and CPU RAM if any)**
+- For each SLEEP2 model on the group (smallest first): send `SIGTERM` (SIGKILL after 30s), mark `UNLOADED`, remove socket file.
+- Stop as soon as enough VRAM or CPU RAM is freed for the pending operation.
 
-**Rule 3 — Terminate idle ACTIVE processes (last resort)**
-- Only models with `active_request_count == 0`. Send `SIGTERM`, release `full_kv_vram_mb`, mark `UNLOADED`. Smallest first.
-- Stop as soon as enough VRAM is freed.
+**Rule 3 — Move SLEEP1 → SLEEP2 (frees CPU RAM held by SLEEP1)**
+- For each SLEEP1 model on the group (smallest first): call `POST /sleep?level=2`, poll `GET /is_sleeping`, release `weights_vram_mb` from CPU RAM accounting, mark `SLEEP2`.
+- Stop as soon as enough CPU RAM is freed.
 
-**Cycle**: `1 → 2 → 3`. If memory is still insufficient after all three rules, return 503 immediately.
+**Rule 4 — Repeat Rule 2** to terminate any SLEEP2 processes and free remaining VRAM after Rule 3 has moved models to SLEEP2.
+
+**Cycle**: `1 → 2 → 3 → 4`. If memory is still insufficient after all four rules, return 503 immediately.
+
+> **Note on Rule 1 / CPU RAM sub-dependency**: Rule 1 calls Rule 2 inline when CPU RAM is the bottleneck before SLEEP1 can proceed. This matches the original spec: *"follow rule 2 if cpu ram needs freed"*.
 
 ---
 
@@ -207,28 +218,36 @@ Resolve model: exact name match OR alias match → not found → 404
          │
          ▼
 Model ACTIVE?
-  YES → forward pass-through (§8A or §8B)
+  YES → forward pass-through immediately (§8A or §8B)
   NO  →
          │
          ▼
-Model SLEEP1?
-  YES → POST /wake_up on vLLM process → poll GET /is_sleeping until false
-      → mark ACTIVE → forward pass-through
+Enqueue request in per-model queue. Queue blocks until model is ACTIVE.
+         │
+         ▼
+Model SLEEP1 or SLEEP2?
+  YES → POST /wake_up → poll GET /is_sleeping until false → mark ACTIVE
+      → drain queue: forward all waiting requests pass-through
   NO  →
          │
          ▼
-Model UNLOADED (or LOADING in progress from another request)?
-  → Run freeing memory rules (§6) if needed
-  → Assign GPU group (§5)
-  → Launch vLLM process (§9)
-  → Poll GET /health until 200 (or timeout → 503)
-  → Mark ACTIVE → forward pass-through
-         │
-         ├── Insufficient memory → 503 {"error":{"message":"Insufficient VRAM to load model","type":"ServiceUnavailableError","code":503}}
-         └── Health poll timeout → 503
+Model UNLOADED (or LOADING already in progress)?
+  LOADING → wait for LOADING → ACTIVE transition, then drain queue
+  UNLOADED →
+    → Run freeing memory rules (§6) if insufficient VRAM
+    ├── Memory still insufficient after all four rules → dequeue all waiters with 503
+    │       {"error":{"message":"Insufficient VRAM to load model","type":"ServiceUnavailableError","code":503}}
+    └── Memory freed → assign GPU group (§5) → launch vLLM process (§9)
+          → poll GET /health until 200
+          ├── Timeout → dequeue all waiters with 503
+          └── Ready → mark ACTIVE → drain queue: forward all waiting requests pass-through
 ```
 
-**No request queuing.** 503 is immediate if resources cannot be freed or the model fails to start. Clients retry.
+**Per-model queue**: requests for a model that is not yet ACTIVE are held in a per-model FIFO channel. They are forwarded as soon as the model reaches ACTIVE. The queue has a configurable depth (`queue_depth`, default 100); arrivals beyond that depth are rejected with 503 immediately.
+
+**503 is only returned** when: (a) all four freeing memory rules have been exhausted and VRAM is still insufficient, (b) the vLLM health poll times out, or (c) the per-model queue is full.
+
+**Concurrent LOADING**: if two requests arrive simultaneously for the same UNLOADED model, only one triggers the load sequence. The second enqueues and waits on the same LOADING → ACTIVE transition.
 
 ---
 
@@ -271,7 +290,7 @@ Routes that need no model field (`GET /health`, `GET /metrics`, `GET /v1/models`
 | `GET` | `/ping` | 200 `{"status":"ok"}` always |
 | `GET` | `/v1/models` | Aggregate from all running vLLM instances + stubs for UNLOADED models |
 
-For `/v1/models`: query each running vLLM's `/v1/models`, merge the `data` arrays. For UNLOADED models, synthesize a minimal stub. Each entry includes an `"orchestrator_state"` field (`"active"`, `"sleep1"`, `"unloaded"`) for observability.
+For `/v1/models`: query each running vLLM's `/v1/models`, merge the `data` arrays. For UNLOADED models, synthesize a minimal stub. Each entry includes an `"orchestrator_state"` field (`"active"`, `"sleep1"`, `"sleep2"`, `"unloaded"`) for observability.
 
 All other routes — `/metrics`, `/version`, `/docs`, `/sleep`, `/wake_up`, `/is_sleeping`, LoRA routes, tokenization routes — are forwarded transparently to the appropriate vLLM instance.
 
@@ -301,7 +320,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
   - If matching lines not found within 60s of process start, warn and retain placeholder.
 - Readiness: poll `GET http://vllm/health` (via Unix socket transport) every 2s until 200 or timeout (default 300s). On timeout: SIGKILL, remove socket file, mark `UNLOADED`, return 503.
 
-### Stopping a vLLM process
+### Stopping a vLLM process (UNLOADED)
 
 1. Confirm `active_request_count == 0`.
 2. `SIGTERM`. Wait 30s. `SIGKILL` if still running.
@@ -309,16 +328,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 
 ### SLEEP1 transition
 
-1. Confirm `active_request_count == 0`. Short quiesce wait (500ms) after last request for streaming stragglers.
-2. `POST http://vllm/sleep?level=1` (via Unix socket transport).
-3. Poll `GET /is_sleeping` until `{"is_sleeping":true}` or 30s timeout.
-4. Release `full_kv_vram_mb` from VRAM accounting; charge `weights_vram_mb` to CPU RAM accounting. Mark `SLEEP1`.
+1. Confirm `active_request_count == 0` for this model.
+2. Short quiesce wait (500ms) for any trailing SSE frames.
+3. `POST http://vllm/sleep?level=1` (via Unix socket transport).
+4. Poll `GET /is_sleeping` until `{"is_sleeping":true}` or 30s timeout.
+5. Release `full_kv_vram_mb` from VRAM accounting; charge `weights_vram_mb` to CPU RAM accounting. Mark `SLEEP1`.
 
-### Wake from SLEEP1
+### SLEEP2 transition
+
+1. Confirm `active_request_count == 0` for this model.
+2. `POST http://vllm/sleep?level=2` (via Unix socket transport).
+3. Poll `GET /is_sleeping` until `{"is_sleeping":true}` or 30s timeout.
+4. Release `weights_vram_mb` from CPU RAM accounting (SLEEP2 holds no CPU RAM). Mark `SLEEP2`.
+
+### Wake from SLEEP1 or SLEEP2
 
 1. `POST http://vllm/wake_up` (via Unix socket transport).
 2. Poll `GET /is_sleeping` until `{"is_sleeping":false}` or 60s timeout.
-3. Restore VRAM accounting; release CPU RAM accounting. Mark `ACTIVE`.
+3. Restore `full_kv_vram_mb` to VRAM accounting; release any CPU RAM held (SLEEP1 only). Mark `ACTIVE`.
 
 ---
 
@@ -328,13 +355,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 
 - `group.measured_total_vram_mb`: queried at orchestrator startup via `nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits`. Device IDs in each group are mapped to their measured totals and summed. This is the only source of truth — no declared value exists.
 - `group.free_vram_mb = group.measured_total_vram_mb − sum(full_kv_vram_mb for LOADING or ACTIVE models on this group)`.
-- Decremented when a model enters `LOADING` or `ACTIVE`; restored when it enters `SLEEP1` or `UNLOADED`.
+- Decremented when a model enters `LOADING` or `ACTIVE`; restored when it enters `SLEEP1`, `SLEEP2`, or `UNLOADED`.
 - Re-queried via `nvidia-smi` every 60s. If measured free VRAM is less than the orchestrator's accounting, log a warning — another process is consuming GPU memory outside the orchestrator's control.
 
 ### CPU RAM
 
 - `free_cpu_ram_mb`: read at orchestrator startup from `/proc/meminfo` (`MemAvailable` line).
-- Decremented by `weights_vram_mb` when a model enters `SLEEP1`; restored when it exits `SLEEP1`.
+- Decremented by `weights_vram_mb` when a model enters `SLEEP1`; restored when it exits `SLEEP1` (to `ACTIVE` or `SLEEP2`).
+- `SLEEP2` holds no CPU RAM.
 - Re-read from `/proc/meminfo` every 60s as a sanity check.
 
 ### `weights_vram_mb` and `full_kv_vram_mb` (per model)
@@ -360,7 +388,7 @@ vLLM-orchestrator/
 ├── main.go          # flag parsing, config load, signal handling, start server
 ├── config.go        # Config struct, YAML parsing, startup validation
 ├── proxy.go         # HTTP reverse proxy, WebSocket proxy, body peek, route dispatch
-├── state.go         # model state machine, TTL timers, transition functions
+├── state.go         # model state machine, TTL timers, transition functions, per-model request queue
 ├── scheduler.go     # freeing memory rules, GPU group assignment
 ├── process.go       # vLLM subprocess launch, log parsing, health poll, teardown, sleep/wake
 ├── memory.go        # VRAM + CPU RAM accounting; nvidia-smi queries; groupState
@@ -378,9 +406,11 @@ All files `package main`. No sub-packages until a second binary is needed.
 
 - One goroutine per running vLLM process: stdout log drain (memory measurement) + stderr drain.
 - One goroutine per model: TTL timer loop + state transition controller.
+- One goroutine per model: queue drain loop — wakes when model transitions to ACTIVE and forwards all queued requests.
 - One goroutine per in-flight proxied request: standard Go HTTP handler goroutine.
 - Two goroutines per active WebSocket connection: bidirectional copy pair.
 - Shared state (`groupState`, model states, `modelMemory`) protected by a single `sync.RWMutex`. Transitions write-locked; reads read-locked.
+- Per-model queue is a buffered `chan http.ResponseWriter/Request` pair; the queue drain goroutine blocks on it.
 - HTTP calls to vLLM (`/sleep`, `/wake_up`) made outside the mutex; state update applied under write lock after the call returns.
 
 ---
@@ -392,7 +422,7 @@ Abort if:
 - Any GPU device ID listed in config is not found in `nvidia-smi` output.
 - Duplicate GPU device IDs across groups.
 - Duplicate model names or aliases.
-- `ttl_active >= ttl_inactive`.
+- `ttl_active >= ttl_inactive` or `ttl_inactive >= ttl_unused`.
 - `vllm_socket_dir` is not writable by the orchestrator process.
 
 Warn (not abort) if:
@@ -409,7 +439,6 @@ Warn (not abort) if:
 - **Metrics aggregation**: `/metrics` forwarded to the matching vLLM instance.
 - **LoRA route awareness**: LoRA routes forwarded blindly.
 - **Dynamic config reload**: Config read once at startup.
-- **vLLM sleep level 2**: Merged with UNLOADED (process terminated).
 
 ---
 
@@ -418,7 +447,7 @@ Warn (not abort) if:
 1. `config.go` — Config struct, YAML parse, validation (no VRAM fields in config).
 2. `memory.go` — nvidia-smi query at startup; `groupState`; CPU RAM from `/proc/meminfo`; periodic re-query goroutine.
 3. `process.go` — subprocess launch with `--uds`, stdout log parsing for memory values, health poll via Unix socket, SIGTERM/SIGKILL, socket file cleanup, sleep/wake HTTP helpers.
-4. `state.go` — model state machine, TTL timers, transition logic, request counter tracking.
+4. `state.go` — model state machine, TTL timers, transition logic, per-model request queue and drain goroutine.
 5. `scheduler.go` — freeing memory rules (§6), GPU group assignment (§5).
 6. `proxy.go` — body peek, HTTP `ReverseProxy` via Unix socket transport, WebSocket proxy via `net.Dial("unix", ...)`, route dispatch.
 7. `models.go` — `/v1/models` aggregation + stub generation.
@@ -434,10 +463,11 @@ Tests for each file in the same order. Table-driven and parallel per the global 
 |---|---|
 | vLLM startup log format changes between versions | Parse defensively with named-group regex; fall back to placeholder on parse failure; log warning |
 | Body buffering breaks large multimodal uploads | `max_request_body_mb` default 256 MB; return 413 on exceed |
-| TTL timer fires while a request is in-flight | Check `active_request_count == 0` before any sleep/terminate; re-arm timer if count > 0 |
+| TTL timer fires while a request is in-flight | Check `active_request_count == 0` for the model before any sleep/terminate transition; re-arm timer if count > 0 |
 | vLLM process hangs on startup | Health poll timeout (default 300s); SIGKILL fallback; 503 to caller |
 | VRAM accounting diverges (OOM kill, other GPU users) | Periodic nvidia-smi re-query every 60s; log warning on divergence |
 | Stale socket file left after orchestrator crash | On startup, enumerate all `*.sock` files in `vllm_socket_dir`; for each, check if a process still owns it via `/proc/<pid>/fd`; kill and remove if orphaned |
 | WebSocket proxy leaks connections | Both sides closed via `sync.Once` + `defer`; context with configurable idle timeout |
 | `POST /sleep` races with trailing SSE frames | 500ms quiesce after `active_request_count` reaches 0 before calling `/sleep` |
 | `VLLM_SERVER_DEV_MODE=1` security exposure | vLLM bound to Unix socket in `vllm_socket_dir` (mode `0700`); no network port exposed by vLLM instances |
+| Rule 1 CPU RAM sub-dependency deadlock | Rule 2 (terminate SLEEP2) is called inline from Rule 1 only when CPU RAM is the bottleneck; Rule 2 only terminates processes with zero in-flight requests, preventing deadlock |
