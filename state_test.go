@@ -115,12 +115,14 @@ func TestDrainQueueWith503(t *testing.T) {
 	me := o.models[0]
 
 	recorders := make([]*httptest.ResponseRecorder, 3)
+	errFlags := make([]bool, 3)
 	for i := range recorders {
 		recorders[i] = httptest.NewRecorder()
 		me.queue <- requestPair{
 			w:    recorders[i],
 			r:    &http.Request{},
 			done: make(chan struct{}),
+			err:  &errFlags[i],
 		}
 	}
 
@@ -145,10 +147,12 @@ func TestDrainQueue(t *testing.T) {
 	dones := make([]chan struct{}, n)
 	for i := range dones {
 		dones[i] = make(chan struct{})
+		ef := false
 		me.queue <- requestPair{
 			w:    httptest.NewRecorder(),
 			r:    &http.Request{},
 			done: dones[i],
+			err:  &ef,
 		}
 	}
 

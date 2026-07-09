@@ -115,7 +115,8 @@ func (o *orchestrator) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 // routeRequest drives the state machine / queuing and then proxies the request.
 func (o *orchestrator) routeRequest(w http.ResponseWriter, r *http.Request, me *modelEntry) {
-	rp := requestPair{w: w, r: r, done: make(chan struct{})}
+	errFlag := false
+	rp := requestPair{w: w, r: r, done: make(chan struct{}), err: &errFlag}
 	o.handleRequest(me, rp)
 
 	select {
@@ -124,8 +125,8 @@ func (o *orchestrator) routeRequest(w http.ResponseWriter, r *http.Request, me *
 		return
 	}
 
-	// rp.err means 503 was already written by drainQueueWith503; do not forward.
-	if rp.err {
+	// errFlag means 503 was already written by drainQueueWith503; do not forward.
+	if errFlag {
 		return
 	}
 
@@ -408,14 +409,15 @@ func (o *orchestrator) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	r.ContentLength = int64(len(buf))
 
-	rp := requestPair{w: w, r: r, done: make(chan struct{})}
+	errFlag2 := false
+	rp := requestPair{w: w, r: r, done: make(chan struct{}), err: &errFlag2}
 	o.handleRequest(me, rp)
 	select {
 	case <-rp.done:
 	case <-r.Context().Done():
 		return
 	}
-	if rp.err {
+	if errFlag2 {
 		return
 	}
 	defer o.completeRequest(me)

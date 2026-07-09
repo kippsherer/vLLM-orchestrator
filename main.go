@@ -52,7 +52,8 @@ func main() {
 	for _, me := range o.models {
 		if me.cfg.LoadAtStartup {
 			go func(m *modelEntry) {
-				rp := requestPair{w: noopResponseWriter{}, r: &http.Request{}, done: make(chan struct{})}
+				errFlag := false
+				rp := requestPair{w: noopResponseWriter{}, r: &http.Request{}, done: make(chan struct{}), err: &errFlag}
 				o.handleRequest(m, rp)
 				<-rp.done
 			}(me)

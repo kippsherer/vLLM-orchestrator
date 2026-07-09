@@ -29,10 +29,11 @@ type GPUGroup struct {
 
 // ModelConfig is the per-model entry from the YAML file.
 type ModelConfig struct {
-	Name          string   `yaml:"name"`
-	Aliases       []string `yaml:"aliases"`
-	LoadAtStartup bool     `yaml:"load_at_startup"`
-	VLLMArgs      []string `yaml:"vllm_args"`
+	Name           string   `yaml:"name"`
+	Aliases        []string `yaml:"aliases"`
+	LoadAtStartup  bool     `yaml:"load_at_startup"`
+	VRAMEstimateMB int64    `yaml:"vram_estimate_mb"` // pre-load VRAM placeholder; 0 = use group-total * 0.85
+	VLLMArgs       []string `yaml:"vllm_args"`
 }
 
 // loadConfig reads and parses the YAML file at path.

@@ -14,6 +14,8 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	var needed int64
 	if me.mem.measured {
 		needed = me.mem.fullKVVRAMMB
+	} else if me.cfg.VRAMEstimateMB > 0 {
+		needed = me.cfg.VRAMEstimateMB
 	} else {
 		o.ms.mu.RLock()
 		smallest := o.ms.groups[0].measuredTotalVRAMMB
@@ -61,6 +63,12 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 			}
 		}
 		if idx < 0 {
+			o.ms.mu.RLock()
+			for _, gs := range o.ms.groups {
+				log.Printf("[scheduler] assignGroup fail: group %s free=%dMB pending=%dMB needed=%dMB",
+					gs.id, gs.measuredFreeMB, gs.pendingVRAMMB, needed)
+			}
+			o.ms.mu.RUnlock()
 			return -1, fmt.Errorf("assign group: insufficient VRAM for %d MB after freeing", needed)
 		}
 	}
@@ -146,7 +154,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		free := gs.measuredFreeMB
 		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
-		log.Printf("[scheduler] rule1: free %dMB → %dMB  %s  ACTIVE → SLEEP1", freeBefore, free, me.cfg.Name)
+		log.Printf("[scheduler] rule1: free %dMB → %dMB (pending %dMB)  %s  ACTIVE → SLEEP1", freeBefore, free, pending, me.cfg.Name)
 		if free-pending >= neededMB {
 			return true
 		}
@@ -209,7 +217,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		free := gs.measuredFreeMB
 		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
-		log.Printf("[scheduler] rule3: free %dMB → %dMB  %s  SLEEP1 → SLEEP2", freeBefore, free, me.cfg.Name)
+		log.Printf("[scheduler] rule3: free %dMB → %dMB (pending %dMB)  %s  SLEEP1 → SLEEP2", freeBefore, free, pending, me.cfg.Name)
 		if free-pending >= neededMB {
 			return true
 		}
@@ -239,7 +247,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		free := gs.measuredFreeMB
 		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
-		log.Printf("[scheduler] rule4: free %dMB → %dMB  %s  SLEEP2 → UNLOADED", freeBefore, free, me.cfg.Name)
+		log.Printf("[scheduler] rule4: free %dMB → %dMB (pending %dMB)  %s  SLEEP2 → UNLOADED", freeBefore, free, pending, me.cfg.Name)
 		if free-pending >= neededMB {
 			return true
 		}

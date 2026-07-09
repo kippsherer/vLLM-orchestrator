@@ -42,7 +42,7 @@ type requestPair struct {
 	// done is closed by the controller when the request may be forwarded or rejected.
 	// err is set before closing done when the request is rejected with a 503.
 	done chan struct{}
-	err  bool // true means 503 was already written; caller must not forward
+	err  *bool // true means 503 was already written; caller must not forward
 }
 
 // modelEntry is the full runtime record for one model.
@@ -397,6 +397,7 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 
 		me.mu.Lock()
 		reserved := me.reservedVRAMMB
+		me.reservedVRAMMB = 0
 		me.state = stateActive
 		me.lastCompleted = time.Now()
 		me.mu.Unlock()
@@ -480,7 +481,7 @@ func (o *orchestrator) drainQueueWith503(me *modelEntry) {
 		select {
 		case rp := <-me.queue:
 			http.Error(rp.w, "service unavailable", http.StatusServiceUnavailable)
-			rp.err = true
+			*rp.err = true
 			close(rp.done)
 		default:
 			return

@@ -14,6 +14,7 @@ models:
   - name: "Qwen/Qwen2.5-32B-Instruct-AWQ"
     aliases: ["qwen2.5-32b", "qwen2.5-32b-awq"]
     load_at_startup: false
+    vram_estimate_mb: 28000
     vllm_args:
       - "--dtype=auto"
       - "--quantization=awq"
@@ -25,6 +26,7 @@ models:
   - name: "Qwen/Qwen3-14B"
     aliases: ["qwen3-14b"]
     load_at_startup: false
+    vram_estimate_mb: 22000
     vllm_args:
       - "--dtype=bfloat16"
       - "--max-model-len=32768"
@@ -35,6 +37,7 @@ models:
   - name: "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
     aliases: ["deepseek-coder", "deepseek-coder-v2-lite"]
     load_at_startup: false
+    vram_estimate_mb: 22000
     vllm_args:
       - "--dtype=bfloat16"
       - "--max-model-len=32768"
@@ -45,6 +48,7 @@ models:
   - name: "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"
     aliases: ["qwen2.5-coder-32b", "qwen-coder"]
     load_at_startup: false
+    vram_estimate_mb: 28000
     vllm_args:
       - "--dtype=auto"
       - "--quantization=awq"
@@ -56,6 +60,7 @@ models:
   - name: "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
     aliases: ["qwen3-vl", "qwen3-vl-8b"]
     load_at_startup: false
+    vram_estimate_mb: 12000
     vllm_args:
       - "--dtype=auto"
       - "--quantization=awq"
