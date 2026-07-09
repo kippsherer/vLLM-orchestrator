@@ -17,7 +17,7 @@ func TestPickGroup(t *testing.T) {
 		{
 			name: "no group qualifies",
 			groups: []*groupState{
-				{id: "g0", measuredTotalVRAMMB: 10000, usedVRAMMB: 9000, measuredFreeMB: -1},
+				{id: "g0", measuredTotalVRAMMB: 10000, measuredFreeMB: 1000},
 			},
 			neededMB: 2000,
 			wantIdx:  -1,
@@ -26,7 +26,7 @@ func TestPickGroup(t *testing.T) {
 		{
 			name: "single qualifying group",
 			groups: []*groupState{
-				{id: "g0", measuredTotalVRAMMB: 24576, usedVRAMMB: 0, measuredFreeMB: -1},
+				{id: "g0", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
 			},
 			neededMB: 8000,
 			wantIdx:  0,
@@ -35,9 +35,9 @@ func TestPickGroup(t *testing.T) {
 		{
 			name: "picks smallest total among qualifying",
 			groups: []*groupState{
-				{id: "g0", measuredTotalVRAMMB: 40960, usedVRAMMB: 0, measuredFreeMB: -1},
-				{id: "g1", measuredTotalVRAMMB: 24576, usedVRAMMB: 0, measuredFreeMB: -1},
-				{id: "g2", measuredTotalVRAMMB: 80000, usedVRAMMB: 0, measuredFreeMB: -1},
+				{id: "g0", measuredTotalVRAMMB: 40960, measuredFreeMB: 40960},
+				{id: "g1", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+				{id: "g2", measuredTotalVRAMMB: 80000, measuredFreeMB: 80000},
 			},
 			neededMB: 8000,
 			wantIdx:  1, // g1 has smallest total
@@ -46,7 +46,7 @@ func TestPickGroup(t *testing.T) {
 		{
 			name: "exact fit",
 			groups: []*groupState{
-				{id: "g0", measuredTotalVRAMMB: 8000, usedVRAMMB: 0, measuredFreeMB: -1},
+				{id: "g0", measuredTotalVRAMMB: 8000, measuredFreeMB: 8000},
 			},
 			neededMB: 8000,
 			wantIdx:  0,
@@ -55,17 +55,17 @@ func TestPickGroup(t *testing.T) {
 		{
 			name: "only larger group qualifies",
 			groups: []*groupState{
-				{id: "g0", measuredTotalVRAMMB: 10000, usedVRAMMB: 9000, measuredFreeMB: -1}, // 1000 free, not enough
-				{id: "g1", measuredTotalVRAMMB: 40960, usedVRAMMB: 0, measuredFreeMB: -1},    // 40960 free
+				{id: "g0", measuredTotalVRAMMB: 10000, measuredFreeMB: 1000},
+				{id: "g1", measuredTotalVRAMMB: 40960, measuredFreeMB: 40960},
 			},
 			neededMB: 8000,
 			wantIdx:  1,
 			wantErr:  false,
 		},
 		{
-			name: "measured free caps accounted free",
+			name: "measured free too low",
 			groups: []*groupState{
-				{id: "g0", measuredTotalVRAMMB: 24576, usedVRAMMB: 0, measuredFreeMB: 3000},
+				{id: "g0", measuredTotalVRAMMB: 24576, measuredFreeMB: 3000},
 			},
 			neededMB: 8000,
 			wantIdx:  -1,

@@ -20,6 +20,7 @@ models:
       - "--max-model-len=16384"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
+      - "--disable-custom-all-reduce"
 
   - name: "Qwen/Qwen3-14B"
     aliases: ["qwen3-14b"]
@@ -29,6 +30,7 @@ models:
       - "--max-model-len=32768"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
+      - "--disable-custom-all-reduce"
 
   - name: "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
     aliases: ["deepseek-coder", "deepseek-coder-v2-lite"]
@@ -38,6 +40,7 @@ models:
       - "--max-model-len=32768"
       - "--enable-prefix-caching"
       - "--trust-remote-code"
+      - "--disable-custom-all-reduce"
 
   - name: "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"
     aliases: ["qwen2.5-coder-32b", "qwen-coder"]
@@ -48,6 +51,7 @@ models:
       - "--max-model-len=16384"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
+      - "--disable-custom-all-reduce"
 
   - name: "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
     aliases: ["qwen3-vl", "qwen3-vl-8b"]
@@ -57,3 +61,4 @@ models:
       - "--quantization=awq"
       - "--max-model-len=8192"
       - "--enable-prefix-caching"
+      - "--disable-custom-all-reduce"

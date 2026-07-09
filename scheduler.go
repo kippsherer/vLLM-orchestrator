@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"time"
 )
 
-// assignGroup implements §5: find the smallest-fitting GPU group for me,
-// running freeing memory rules (§6) if needed. Reserves VRAM on success.
-// Returns the index into ms.groups, or error if no group can be freed sufficiently.
+// assignGroup finds the smallest GPU group whose total VRAM can hold the model,
+// running freeMemoryRules on each candidate group until one has enough free VRAM.
+// Reserves VRAM on success.
 func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	var needed int64
 	if me.mem.measured {
@@ -25,43 +26,56 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 		needed = int64(float64(smallest) * 0.85)
 	}
 
+	refreshMemory(o.ms)
+
 	o.ms.mu.Lock()
 	idx, err := o.pickGroup(needed)
 	o.ms.mu.Unlock()
 
 	if err != nil {
-		// Run freeing memory rules — they manage ms.mu internally.
-		if freeErr := o.freeMemoryRules(needed); freeErr != nil {
-			return -1, fmt.Errorf("assign group: %w", freeErr)
+		// No group has enough free VRAM right now. Run freeing rules on each
+		// group whose total VRAM is large enough to hold the model, stopping
+		// as soon as one group has enough free VRAM.
+		idx = -1
+		o.ms.mu.RLock()
+		var candidates []*groupState
+		for _, gs := range o.ms.groups {
+			if gs.measuredTotalVRAMMB >= needed {
+				candidates = append(candidates, gs)
+			}
 		}
-		o.ms.mu.Lock()
-		idx, err = o.pickGroup(needed)
-		o.ms.mu.Unlock()
-		if err != nil {
-			return -1, fmt.Errorf("assign group: still insufficient after freeing: %w", err)
+		o.ms.mu.RUnlock()
+		for i, gs := range candidates {
+			if o.freeMemoryRules(gs, needed) {
+				// Find the index of this group in ms.groups.
+				o.ms.mu.RLock()
+				for j, g := range o.ms.groups {
+					if g == gs {
+						idx = j
+						break
+					}
+				}
+				o.ms.mu.RUnlock()
+				_ = i
+				break
+			}
+		}
+		if idx < 0 {
+			return -1, fmt.Errorf("assign group: insufficient VRAM for %d MB after freeing", needed)
 		}
 	}
 
-	// Reserve VRAM and snapshot the reserved amount on the model entry.
-	o.ms.mu.Lock()
-	o.ms.groups[idx].usedVRAMMB += needed
-	o.ms.mu.Unlock()
 	me.reservedVRAMMB = needed
 	return idx, nil
 }
 
 // pickGroup finds the qualifying group with the smallest measuredTotalVRAMMB.
 // Must be called with ms.mu held.
-// effectiveFree is the minimum of freeVRAMMB() and measuredFreeMB (when measured).
 func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
 	best := -1
 	var bestTotal int64
 	for i, gs := range o.ms.groups {
-		free := gs.freeVRAMMB()
-		if gs.measuredFreeMB >= 0 && gs.measuredFreeMB < free {
-			free = gs.measuredFreeMB
-		}
-		if free >= neededMB {
+		if gs.measuredFreeMB >= neededMB {
 			if best < 0 || gs.measuredTotalVRAMMB < bestTotal {
 				best = i
 				bestTotal = gs.measuredTotalVRAMMB
@@ -74,41 +88,213 @@ func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
 	return best, nil
 }
 
-// freeMemoryRules runs the §6 eviction cycle per GPU group.
-// Each rule iterates smallest-model-first and calls groupHasEnough (refreshMemory
-// + real VRAM check) after every individual model action, stopping that rule as
-// soon as the group has enough. Rules run in order 1→2→3→4 per group.
-// Returns nil as soon as any group reaches neededMB free; error if exhausted.
+// freeMemoryRules applies the four eviction rules to a single GPU group gs.
+// Rules are applied in order. After each individual model action, refreshMemory
+// is called and free VRAM is checked — returning true immediately if enough is
+// freed. Returns false if all four rules are exhausted without freeing enough.
 //
-//	Rule 1: ACTIVE → SLEEP1 (free CPU RAM via rule2ForCPU first if needed)
-//	Rule 2: SLEEP2 → UNLOADED (kill process)
-//	Rule 3: SLEEP1 → SLEEP2
-//	Rule 4: repeat Rule 2 (handles models newly in SLEEP2 after Rule 3)
-func (o *orchestrator) freeMemoryRules(neededMB int64) error {
-	for _, gs := range o.ms.groups {
-		o.rule1ForGroup(gs, neededMB)
-		o.rule2ForGroup(gs, neededMB)
-		o.rule3ForGroup(gs, neededMB)
-		o.rule2ForGroup(gs, neededMB) // rule 4 = repeat rule 2
-		if o.groupHasEnough(gs, neededMB) {
-			return nil
+// Rule 1: idle ACTIVE → SLEEP1 (smallest fullKVVRAMMB first; free CPU RAM first if needed)
+// Rule 2: idle SLEEP2 → UNLOADED, kill process (smallest fullKVVRAMMB first)
+// Rule 3: idle SLEEP1 → SLEEP2 (smallest weightsVRAMMB first)
+// Rule 4: repeat Rule 2
+func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
+	// Rule 1: ACTIVE → SLEEP1
+	for _, me := range o.idleActiveModels() {
+		me.mu.Lock()
+		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
+			me.mu.Unlock()
+			continue
+		}
+		weightsVRAM := me.mem.weightsVRAMMB
+		proc := me.proc
+		me.mu.Unlock()
+
+		// Free CPU RAM first if needed (rule 1 spec: follow rule 2 if cpu ram needs freed).
+		o.ms.mu.RLock()
+		cpuFree := o.ms.freeCPURAMB
+		o.ms.mu.RUnlock()
+		if cpuFree < weightsVRAM {
+			o.freeCPURam(weightsVRAM)
+			o.ms.mu.RLock()
+			cpuFree = o.ms.freeCPURAMB
+			o.ms.mu.RUnlock()
+		}
+		if cpuFree < weightsVRAM {
+			continue
+		}
+
+		o.ms.mu.RLock()
+		freeBefore := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+
+		if err := sleepModel(proc, me.cfg.Name, 1); err != nil {
+			log.Printf("[scheduler] rule1: sleep error %s: %v", me.cfg.Name, err)
+			continue
+		}
+		me.mu.Lock()
+		me.state = stateSleep1
+		me.mu.Unlock()
+		o.ms.mu.Lock()
+		o.ms.freeCPURAMB -= weightsVRAM
+		o.ms.mu.Unlock()
+
+		refreshMemory(o.ms)
+		o.ms.mu.RLock()
+		free := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+		log.Printf("[scheduler] rule1: free %dMB → %dMB  %s  ACTIVE → SLEEP1", freeBefore, free, me.cfg.Name)
+		if free >= neededMB {
+			return true
 		}
 	}
-	return fmt.Errorf("freeing memory rules exhausted; insufficient VRAM for %d MB", neededMB)
+
+	// Rule 2: SLEEP2 → UNLOADED
+	for _, me := range o.idleSleep2Models() {
+		me.mu.Lock()
+		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
+			me.mu.Unlock()
+			continue
+		}
+		proc := me.proc
+		me.state = stateUnloaded
+		me.proc = nil
+		me.reservedVRAMMB = 0
+		me.assignedGroupIdx = -1
+		me.mu.Unlock()
+
+		o.ms.mu.RLock()
+		freeBefore := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+
+		killProcess(proc, me.cfg.Name)
+		waitVRAMStable(o.ms, gs)
+		o.ms.mu.RLock()
+		free := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+		log.Printf("[scheduler] rule2: free %dMB → %dMB  %s  SLEEP2 → UNLOADED", freeBefore, free, me.cfg.Name)
+		if free >= neededMB {
+			return true
+		}
+	}
+
+	// Rule 3: SLEEP1 → SLEEP2
+	for _, me := range o.idleSleep1Models() {
+		me.mu.Lock()
+		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
+			me.mu.Unlock()
+			continue
+		}
+		proc := me.proc
+		me.mu.Unlock()
+
+		o.ms.mu.RLock()
+		freeBefore := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+
+		if err := sleepModel(proc, me.cfg.Name, 2); err != nil {
+			log.Printf("[scheduler] rule3: sleep2 error %s: %v", me.cfg.Name, err)
+			continue
+		}
+		me.mu.Lock()
+		me.state = stateSleep2
+		me.mu.Unlock()
+
+		refreshMemory(o.ms)
+		o.ms.mu.RLock()
+		free := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+		log.Printf("[scheduler] rule3: free %dMB → %dMB  %s  SLEEP1 → SLEEP2", freeBefore, free, me.cfg.Name)
+		if free >= neededMB {
+			return true
+		}
+	}
+
+	// Rule 4: repeat Rule 2
+	for _, me := range o.idleSleep2Models() {
+		me.mu.Lock()
+		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
+			me.mu.Unlock()
+			continue
+		}
+		proc := me.proc
+		me.state = stateUnloaded
+		me.proc = nil
+		me.reservedVRAMMB = 0
+		me.assignedGroupIdx = -1
+		me.mu.Unlock()
+
+		o.ms.mu.RLock()
+		freeBefore := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+
+		killProcess(proc, me.cfg.Name)
+		waitVRAMStable(o.ms, gs)
+		o.ms.mu.RLock()
+		free := gs.measuredFreeMB
+		o.ms.mu.RUnlock()
+		log.Printf("[scheduler] rule4: free %dMB → %dMB  %s  SLEEP2 → UNLOADED", freeBefore, free, me.cfg.Name)
+		if free >= neededMB {
+			return true
+		}
+	}
+
+	return false
 }
 
-// groupHasEnough calls refreshMemory to get real free VRAM, then checks whether
-// gs has at least neededMB free. It is the only place that decides "enough freed".
-func (o *orchestrator) groupHasEnough(gs *groupState, neededMB int64) bool {
-	refreshMemory(o.ms)
-	o.ms.mu.RLock()
-	free := gs.measuredFreeMB
-	o.ms.mu.RUnlock()
-	return free >= neededMB
+// freeCPURam demotes idle SLEEP1 models to SLEEP2 (smallest weightsVRAMMB first)
+// until real free CPU RAM >= neededCPUMB. Called inline from rule 1.
+func (o *orchestrator) freeCPURam(neededCPUMB int64) {
+	for _, me := range o.idleSleep1Models() {
+		refreshMemory(o.ms)
+		o.ms.mu.RLock()
+		cpuFree := o.ms.freeCPURAMB
+		o.ms.mu.RUnlock()
+		if cpuFree >= neededCPUMB {
+			return
+		}
+
+		me.mu.Lock()
+		proc := me.proc
+		me.mu.Unlock()
+
+		if err := sleepModel(proc, me.cfg.Name, 2); err != nil {
+			log.Printf("[scheduler] freeCPURam: sleep2 error %s: %v", me.cfg.Name, err)
+			continue
+		}
+		me.mu.Lock()
+		me.state = stateSleep2
+		me.mu.Unlock()
+		refreshMemory(o.ms)
+		o.ms.mu.RLock()
+		cpuAfter := o.ms.freeCPURAMB
+		o.ms.mu.RUnlock()
+		log.Printf("[scheduler] freeCPURam: cpu free %dMB → %dMB  %s  SLEEP1 → SLEEP2", cpuFree, cpuAfter, me.cfg.Name)
+	}
 }
 
-// idleActiveModels returns all ACTIVE modelEntry with no in-flight requests,
-// sorted smallest fullKVVRAMMB first.
+// waitVRAMStable polls nvidia-smi after a process kill until measuredFreeMB
+// stops increasing between consecutive reads (500ms apart), or 10 seconds elapse.
+// This replaces a fixed sleep and ensures the GPU driver has finished reclaiming
+// memory before the caller checks whether enough is free.
+func waitVRAMStable(ms *memoryState, gs *groupState) {
+	deadline := time.Now().Add(10 * time.Second)
+	ms.mu.RLock()
+	prev := gs.measuredFreeMB
+	ms.mu.RUnlock()
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		refreshMemory(ms)
+		ms.mu.RLock()
+		cur := gs.measuredFreeMB
+		ms.mu.RUnlock()
+		if cur <= prev {
+			return
+		}
+		prev = cur
+	}
+}
+
+// idleActiveModels returns idle ACTIVE models sorted smallest fullKVVRAMMB first.
 func (o *orchestrator) idleActiveModels() []*modelEntry {
 	var out []*modelEntry
 	for _, me := range o.models {
@@ -126,8 +312,7 @@ func (o *orchestrator) idleActiveModels() []*modelEntry {
 	return out
 }
 
-// idleSleep2Models returns all SLEEP2 modelEntry with no in-flight requests,
-// sorted smallest fullKVVRAMMB first.
+// idleSleep2Models returns idle SLEEP2 models sorted smallest fullKVVRAMMB first.
 func (o *orchestrator) idleSleep2Models() []*modelEntry {
 	var out []*modelEntry
 	for _, me := range o.models {
@@ -145,8 +330,7 @@ func (o *orchestrator) idleSleep2Models() []*modelEntry {
 	return out
 }
 
-// idleSleep1Models returns all SLEEP1 modelEntry with no in-flight requests,
-// sorted smallest weightsVRAMMB first.
+// idleSleep1Models returns idle SLEEP1 models sorted smallest weightsVRAMMB first.
 func (o *orchestrator) idleSleep1Models() []*modelEntry {
 	var out []*modelEntry
 	for _, me := range o.models {
@@ -162,135 +346,4 @@ func (o *orchestrator) idleSleep1Models() []*modelEntry {
 		return out[i].mem.weightsVRAMMB < out[j].mem.weightsVRAMMB
 	})
 	return out
-}
-
-// rule1ForGroup moves idle ACTIVE models on gs to SLEEP1, smallest first.
-// Before each model action, checks whether CPU RAM is sufficient; if not,
-// calls rule2ForCPU to free CPU RAM first (by demoting SLEEP1→SLEEP2 on
-// other groups). Stops as soon as gs has enough free VRAM.
-func (o *orchestrator) rule1ForGroup(gs *groupState, neededMB int64) {
-	for _, me := range o.idleActiveModels() {
-		me.mu.Lock()
-		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
-			me.mu.Unlock()
-			continue
-		}
-		weightsVRAM := me.mem.weightsVRAMMB
-		proc := me.proc
-		me.mu.Unlock()
-
-		// Ensure CPU RAM is available before moving to SLEEP1.
-		o.ms.mu.RLock()
-		cpuFree := o.ms.freeCPURAMB
-		o.ms.mu.RUnlock()
-		if cpuFree < weightsVRAM {
-			o.rule2ForCPU(weightsVRAM)
-			o.ms.mu.RLock()
-			cpuFree = o.ms.freeCPURAMB
-			o.ms.mu.RUnlock()
-		}
-		if cpuFree < weightsVRAM {
-			continue
-		}
-
-		if err := sleepModel(proc, me.cfg.Name, 1); err != nil {
-			log.Printf("[scheduler] rule1: sleep error %s: %v", me.cfg.Name, err)
-			continue
-		}
-		me.mu.Lock()
-		groupIdx := me.assignedGroupIdx
-		reserved := me.reservedVRAMMB
-		me.state = stateSleep1
-		me.mu.Unlock()
-		o.ms.mu.Lock()
-		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB -= reserved
-		}
-		o.ms.freeCPURAMB -= weightsVRAM
-		o.ms.mu.Unlock()
-		log.Printf("[scheduler] rule1: %s ACTIVE → SLEEP1", me.cfg.Name)
-
-		if o.groupHasEnough(gs, neededMB) {
-			return
-		}
-	}
-}
-
-// rule2ForGroup kills idle SLEEP2 processes on gs, smallest first, until gs
-// has enough free VRAM. Real free VRAM is re-measured after each kill.
-func (o *orchestrator) rule2ForGroup(gs *groupState, neededMB int64) {
-	for _, me := range o.idleSleep2Models() {
-		me.mu.Lock()
-		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
-			me.mu.Unlock()
-			continue
-		}
-		proc := me.proc
-		me.state = stateUnloaded
-		me.proc = nil
-		me.reservedVRAMMB = 0
-		me.assignedGroupIdx = -1
-		me.mu.Unlock()
-
-		killProcess(proc, me.cfg.Name)
-		log.Printf("[scheduler] rule2: %s SLEEP2 → UNLOADED", me.cfg.Name)
-
-		if o.groupHasEnough(gs, neededMB) {
-			return
-		}
-	}
-}
-
-// rule2ForCPU demotes idle SLEEP1 models to SLEEP2 (smallest weightsVRAMMB first)
-// until real free CPU RAM >= neededCPUMB. Reads /proc/meminfo after each action.
-func (o *orchestrator) rule2ForCPU(neededCPUMB int64) {
-	for _, me := range o.idleSleep1Models() {
-		refreshMemory(o.ms)
-		o.ms.mu.RLock()
-		cpuFree := o.ms.freeCPURAMB
-		o.ms.mu.RUnlock()
-		if cpuFree >= neededCPUMB {
-			return
-		}
-
-		me.mu.Lock()
-		proc := me.proc
-		me.mu.Unlock()
-
-		if err := sleepModel(proc, me.cfg.Name, 2); err != nil {
-			log.Printf("[scheduler] rule2ForCPU: sleep2 error %s: %v", me.cfg.Name, err)
-			continue
-		}
-		me.mu.Lock()
-		me.state = stateSleep2
-		me.mu.Unlock()
-		log.Printf("[scheduler] rule2ForCPU: %s SLEEP1 → SLEEP2", me.cfg.Name)
-	}
-}
-
-// rule3ForGroup demotes idle SLEEP1 models on gs to SLEEP2, smallest first,
-// until gs has enough free VRAM.
-func (o *orchestrator) rule3ForGroup(gs *groupState, neededMB int64) {
-	for _, me := range o.idleSleep1Models() {
-		me.mu.Lock()
-		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
-			me.mu.Unlock()
-			continue
-		}
-		proc := me.proc
-		me.mu.Unlock()
-
-		if err := sleepModel(proc, me.cfg.Name, 2); err != nil {
-			log.Printf("[scheduler] rule3: sleep2 error %s: %v", me.cfg.Name, err)
-			continue
-		}
-		me.mu.Lock()
-		me.state = stateSleep2
-		me.mu.Unlock()
-		log.Printf("[scheduler] rule3: %s SLEEP1 → SLEEP2", me.cfg.Name)
-
-		if o.groupHasEnough(gs, neededMB) {
-			return
-		}
-	}
 }

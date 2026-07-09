@@ -209,27 +209,16 @@ func (o *orchestrator) transitionToSleep(me *modelEntry, proc *vllmProcess, leve
 	}
 
 	prevState := me.state
-	groupIdx := me.assignedGroupIdx
-	reserved := me.reservedVRAMMB
 	weightsVRAM := me.mem.weightsVRAMMB
 
 	o.ms.mu.Lock()
 	switch {
 	case prevState == stateActive && level == 1:
-		// Release VRAM; charge CPU RAM.
-		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB -= reserved
-		}
 		o.ms.freeCPURAMB -= weightsVRAM
 		me.state = stateSleep1
 	case prevState == stateActive && level == 2:
-		// Release VRAM; no CPU RAM charged.
-		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB -= reserved
-		}
 		me.state = stateSleep2
 	case prevState == stateSleep1 && level == 2:
-		// Release CPU RAM only (VRAM already released on SLEEP1 entry).
 		o.ms.freeCPURAMB += weightsVRAM
 		me.state = stateSleep2
 	}
@@ -244,7 +233,6 @@ func (o *orchestrator) wakeAndActivate(me *modelEntry) error {
 	me.mu.Lock()
 	proc := me.proc
 	prevState := me.state
-	groupIdx := me.assignedGroupIdx
 	me.mu.Unlock()
 
 	if proc == nil {
@@ -261,21 +249,11 @@ func (o *orchestrator) wakeAndActivate(me *modelEntry) error {
 		return nil
 	}
 
-	reserved := me.reservedVRAMMB
 	weightsVRAM := me.mem.weightsVRAMMB
 
 	o.ms.mu.Lock()
 	if prevState == stateSleep1 {
-		// Restore VRAM; release CPU RAM.
-		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB += reserved
-		}
 		o.ms.freeCPURAMB += weightsVRAM
-	} else {
-		// SLEEP2: restore VRAM only.
-		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB += reserved
-		}
 	}
 	o.ms.mu.Unlock()
 
@@ -354,14 +332,10 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		if err != nil {
 			log.Printf("[orchestrator] %s: launch failed: %v", me.cfg.Name, err)
 			me.mu.Lock()
-			reserved := me.reservedVRAMMB
 			me.state = stateUnloaded
 			me.assignedGroupIdx = -1
 			me.reservedVRAMMB = 0
 			me.mu.Unlock()
-			o.ms.mu.Lock()
-			o.ms.groups[groupIdx].usedVRAMMB -= reserved
-			o.ms.mu.Unlock()
 			o.drainQueueWith503(me)
 			return
 		}
@@ -375,22 +349,14 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		proc.onExit = func() {
 			me.mu.Lock()
 			if me.proc != proc {
-				// A new process has already taken over; do nothing.
 				me.mu.Unlock()
 				return
 			}
-			reserved := me.reservedVRAMMB
-			gIdx := me.assignedGroupIdx
 			me.state = stateUnloaded
 			me.proc = nil
 			me.assignedGroupIdx = -1
 			me.reservedVRAMMB = 0
 			me.mu.Unlock()
-			if gIdx >= 0 && reserved > 0 {
-				o.ms.mu.Lock()
-				o.ms.groups[gIdx].usedVRAMMB -= reserved
-				o.ms.mu.Unlock()
-			}
 			log.Printf("[orchestrator] %s: process exited unexpectedly → UNLOADED", me.cfg.Name)
 			o.drainQueueWith503(me)
 		}
@@ -398,21 +364,21 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		if err := waitForHealth(proc, me.cfg.Name); err != nil {
 			log.Printf("[orchestrator] %s: health poll failed: %v", me.cfg.Name, err)
 			me.mu.Lock()
-			reserved := me.reservedVRAMMB
 			me.state = stateUnloaded
 			me.proc = nil
 			me.assignedGroupIdx = -1
 			me.reservedVRAMMB = 0
 			me.mu.Unlock()
-			o.ms.mu.Lock()
-			o.ms.groups[groupIdx].usedVRAMMB -= reserved
-			o.ms.mu.Unlock()
 			o.drainQueueWith503(me)
 			return
 		}
 
 		// Refine VRAM reservation from placeholder to actual if now measured.
-		o.refineMeasuredVRAM(me, groupIdx)
+		me.mu.Lock()
+		if me.mem.measured {
+			me.reservedVRAMMB = me.mem.fullKVVRAMMB
+		}
+		me.mu.Unlock()
 
 		me.mu.Lock()
 		me.state = stateActive
@@ -460,27 +426,6 @@ func (o *orchestrator) watchHealth(me *modelEntry, proc *vllmProcess) {
 			return
 		}
 	}
-}
-
-// refineMeasuredVRAM replaces the placeholder VRAM reservation with the actual
-// measured fullKVVRAMMB if it is now available.
-func (o *orchestrator) refineMeasuredVRAM(me *modelEntry, groupIdx int) {
-	me.mu.Lock()
-	measured := me.mem.measured
-	actual := me.mem.fullKVVRAMMB
-	reserved := me.reservedVRAMMB
-	me.mu.Unlock()
-
-	if !measured || actual == reserved {
-		return
-	}
-	o.ms.mu.Lock()
-	o.ms.groups[groupIdx].usedVRAMMB = o.ms.groups[groupIdx].usedVRAMMB - reserved + actual
-	o.ms.mu.Unlock()
-
-	me.mu.Lock()
-	me.reservedVRAMMB = actual
-	me.mu.Unlock()
 }
 
 // placeholderVRAM returns group.measuredTotalVRAMMB * 0.85 as the placeholder

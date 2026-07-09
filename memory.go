@@ -16,17 +16,7 @@ type groupState struct {
 	id                  string
 	gpus                []int
 	measuredTotalVRAMMB int64 // from nvidia-smi at startup
-	usedVRAMMB          int64 // sum of reservedVRAMMB for LOADING+ACTIVE models on this group
 	measuredFreeMB      int64 // actual free VRAM from nvidia-smi; -1 until first refreshMemory call
-}
-
-// freeVRAMMB returns measuredTotalVRAMMB minus usedVRAMMB, floored at 0.
-func (g *groupState) freeVRAMMB() int64 {
-	v := g.measuredTotalVRAMMB - g.usedVRAMMB
-	if v < 0 {
-		return 0
-	}
-	return v
 }
 
 // memoryState holds all VRAM and CPU RAM accounting.
@@ -207,14 +197,6 @@ func refreshMemory(ms *memoryState) {
 			}
 		}
 		gs.measuredFreeMB = measuredFreeMB
-		accounted := gs.measuredTotalVRAMMB - gs.usedVRAMMB
-		if accounted < 0 {
-			accounted = 0
-		}
-		if measuredFreeMB < accounted {
-			log.Printf("memory refresh: group %q accounted free=%dMB but measured free=%dMB (divergence %dMB) — scheduling will use measured value",
-				gs.id, accounted, measuredFreeMB, accounted-measuredFreeMB)
-		}
 	}
 
 	cpuMB, err := readMemAvailableMB()
