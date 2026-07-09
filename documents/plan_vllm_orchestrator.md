@@ -65,6 +65,7 @@ models:
 - GPU groups declare only CUDA device IDs. **Total VRAM per group is measured from `nvidia-smi` at orchestrator startup** — not declared. The orchestrator queries `nvidia-smi --query-gpu=index,memory.total --format=csv,noheader,nounits`, maps each device ID to its measured total, and sums per group. This is the authoritative value used for all scheduling.
 - `weights_vram_mb` and `full_kv_vram_mb` are **not** in config — auto-measured at first launch of each model by parsing vLLM's startup logs (see §10).
 - `vllm_args` are appended to `vllm serve <model_name>` exactly as written. The orchestrator auto-injects `--uds`, `--tensor-parallel-size`, and `CUDA_VISIBLE_DEVICES`; the user must not include these.
+- `HF_TOKEN`: if set in the orchestrator's environment, it is forwarded verbatim into each vLLM subprocess environment. This is the only mechanism needed for gated HuggingFace models — vLLM's bundled `huggingface_hub` library picks it up automatically when downloading weights. The token is never written to config or logs.
 - TTLs are global; per-model overrides can be added in a future revision.
 
 ---
