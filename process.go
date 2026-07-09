@@ -27,6 +27,7 @@ type vllmProcess struct {
 	cmd        *exec.Cmd
 	socketPath string
 	client     *http.Client // HTTP client dialling the Unix socket
+	onExit     func()       // called exactly once when the process exits for any reason
 }
 
 // launchVLLM starts a vLLM subprocess for modelCfg on gpuGroup and returns
@@ -79,6 +80,13 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 
 	go drainAndMeasure(stdout, modelCfg.Name, mem, true)
 	go drainLog(stderr, modelCfg.Name)
+	go func() {
+		cmd.Wait()
+		os.Remove(socketPath)
+		if vp.onExit != nil {
+			vp.onExit()
+		}
+	}()
 
 	return vp, nil
 }

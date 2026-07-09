@@ -219,16 +219,13 @@ func (o *orchestrator) rule2(neededMB int64) {
 				continue
 			}
 			proc := me.proc
-			me.mu.Unlock()
-
-			killProcess(proc, me.cfg.Name)
-
-			me.mu.Lock()
 			me.state = stateUnloaded
 			me.proc = nil
 			me.reservedVRAMMB = 0
 			me.assignedGroupIdx = -1
 			me.mu.Unlock()
+
+			killProcess(proc, me.cfg.Name)
 			// SLEEP2 holds no VRAM in accounting — no usedVRAMMB change needed.
 			log.Printf("[scheduler] rule2: %s SLEEP2 → UNLOADED", me.cfg.Name)
 
@@ -253,16 +250,13 @@ func (o *orchestrator) rule2ForCPU(neededCPUMB int64) {
 		}
 		me.mu.Lock()
 		proc := me.proc
-		me.mu.Unlock()
-
-		killProcess(proc, me.cfg.Name)
-
-		me.mu.Lock()
 		me.state = stateUnloaded
 		me.proc = nil
 		me.reservedVRAMMB = 0
 		me.assignedGroupIdx = -1
 		me.mu.Unlock()
+
+		killProcess(proc, me.cfg.Name)
 		log.Printf("[scheduler] rule2ForCPU: %s SLEEP2 → UNLOADED", me.cfg.Name)
 	}
 }

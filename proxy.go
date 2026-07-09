@@ -103,7 +103,10 @@ func (o *orchestrator) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "model not found", http.StatusNotFound)
 		return
 	}
-	// Restore body.
+	// Rewrite alias to canonical name so vLLM recognises it.
+	if modelName != me.cfg.Name {
+		buf = rewriteModelField(buf, me.cfg.Name)
+	}
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	r.ContentLength = int64(len(buf))
 
@@ -179,6 +182,61 @@ func peekModel(r *http.Request) (string, []byte, error) {
 	}
 	model := extractModelField(buf)
 	return model, buf, nil
+}
+
+// rewriteModelField returns a copy of buf with the top-level "model" string
+// value replaced by canonicalName. All other bytes are preserved verbatim.
+func rewriteModelField(buf []byte, canonicalName string) []byte {
+	key := []byte(`"model"`)
+	i := bytes.Index(buf, key)
+	if i < 0 {
+		return buf
+	}
+	i += len(key)
+	// Skip whitespace and colon.
+	for i < len(buf) && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r') {
+		i++
+	}
+	if i >= len(buf) || buf[i] != ':' {
+		return buf
+	}
+	i++
+	for i < len(buf) && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r') {
+		i++
+	}
+	if i >= len(buf) || buf[i] != '"' {
+		return buf
+	}
+	// valueStart is the opening quote of the current model value.
+	valueStart := i
+	i++ // skip opening quote
+	for i < len(buf) {
+		c := buf[i]
+		if c == '"' {
+			break
+		}
+		if c == '\\' {
+			i++ // skip escaped char
+		}
+		i++
+	}
+	if i >= len(buf) {
+		return buf
+	}
+	// valueEnd is the closing quote (inclusive).
+	valueEnd := i
+
+	// Build replacement: everything before valueStart + quoted canonical name + everything after valueEnd.
+	quoted := make([]byte, 0, len(canonicalName)+2)
+	quoted = append(quoted, '"')
+	quoted = append(quoted, []byte(canonicalName)...)
+	quoted = append(quoted, '"')
+
+	out := make([]byte, 0, len(buf)-int(valueEnd-valueStart)+len(quoted))
+	out = append(out, buf[:valueStart]...)
+	out = append(out, quoted...)
+	out = append(out, buf[valueEnd+1:]...)
+	return out
 }
 
 // extractModelField performs a minimal scan of a JSON byte slice to find the
@@ -343,6 +401,9 @@ func (o *orchestrator) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if me == nil {
 		http.Error(w, "model not found", http.StatusNotFound)
 		return
+	}
+	if modelName != me.cfg.Name {
+		buf = rewriteModelField(buf, me.cfg.Name)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	r.ContentLength = int64(len(buf))

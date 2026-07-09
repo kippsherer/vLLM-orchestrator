@@ -244,3 +244,48 @@ func TestPeekModel(t *testing.T) {
 		})
 	}
 }
+
+func TestRewriteModelField(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		input     string
+		canonical string
+		want      string
+	}{
+		{
+			name:      "alias replaced",
+			input:     `{"model":"llama3","stream":true}`,
+			canonical: "meta-llama/Meta-Llama-3-8B-Instruct",
+			want:      `{"model":"meta-llama/Meta-Llama-3-8B-Instruct","stream":true}`,
+		},
+		{
+			name:      "already canonical no change",
+			input:     `{"model":"meta-llama/Meta-Llama-3-8B-Instruct","stream":true}`,
+			canonical: "meta-llama/Meta-Llama-3-8B-Instruct",
+			want:      `{"model":"meta-llama/Meta-Llama-3-8B-Instruct","stream":true}`,
+		},
+		{
+			name:      "model key absent returns unchanged",
+			input:     `{"stream":true}`,
+			canonical: "canonical",
+			want:      `{"stream":true}`,
+		},
+		{
+			name:      "other fields preserved",
+			input:     `{"model":"alias","messages":[{"role":"user","content":"hi"}],"temperature":0.7}`,
+			canonical: "Qwen/Qwen3-14B",
+			want:      `{"model":"Qwen/Qwen3-14B","messages":[{"role":"user","content":"hi"}],"temperature":0.7}`,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := rewriteModelField([]byte(tc.input), tc.canonical)
+			if string(got) != tc.want {
+				t.Errorf("rewriteModelField(%q, %q)\n got  %q\n want %q", tc.input, tc.canonical, got, tc.want)
+			}
+		})
+	}
+}

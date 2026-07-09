@@ -371,6 +371,30 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		me.assignedGroupIdx = groupIdx
 		me.mu.Unlock()
 
+		// Register crash handler: if vLLM exits unexpectedly, release VRAM and mark UNLOADED.
+		proc.onExit = func() {
+			me.mu.Lock()
+			if me.proc != proc {
+				// A new process has already taken over; do nothing.
+				me.mu.Unlock()
+				return
+			}
+			reserved := me.reservedVRAMMB
+			gIdx := me.assignedGroupIdx
+			me.state = stateUnloaded
+			me.proc = nil
+			me.assignedGroupIdx = -1
+			me.reservedVRAMMB = 0
+			me.mu.Unlock()
+			if gIdx >= 0 && reserved > 0 {
+				o.ms.mu.Lock()
+				o.ms.groups[gIdx].usedVRAMMB -= reserved
+				o.ms.mu.Unlock()
+			}
+			log.Printf("[orchestrator] %s: process exited unexpectedly → UNLOADED", me.cfg.Name)
+			o.drainQueueWith503(me)
+		}
+
 		if err := waitForHealth(proc, me.cfg.Name); err != nil {
 			log.Printf("[orchestrator] %s: health poll failed: %v", me.cfg.Name, err)
 			me.mu.Lock()
