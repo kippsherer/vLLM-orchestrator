@@ -37,6 +37,10 @@ func main() {
 		log.Fatalf("init memory: %v", err)
 	}
 
+	// Correct VRAM accounting immediately for any pre-existing GPU usage
+	// from processes outside this orchestrator instance.
+	refreshMemory(ms)
+
 	// Remove stale socket files from a prior crash.
 	cleanStaleSocketFiles(cfg)
 

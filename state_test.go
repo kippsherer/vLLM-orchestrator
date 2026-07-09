@@ -25,7 +25,7 @@ func makeTestOrchestrator(t *testing.T) *orchestrator {
 	}
 	ms := &memoryState{
 		groups: []*groupState{
-			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576},
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: -1},
 		},
 		freeCPURAMB: 65536,
 	}

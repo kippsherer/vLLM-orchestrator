@@ -80,13 +80,9 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 
 	go drainAndMeasure(stdout, modelCfg.Name, mem, true)
 	go drainLog(stderr, modelCfg.Name)
-	go func() {
-		cmd.Wait()
-		os.Remove(socketPath)
-		if vp.onExit != nil {
-			vp.onExit()
-		}
-	}()
+	// Reap the top-level process to avoid zombies. VRAM accounting is NOT
+	// driven by this — vLLM's worker children outlive the parent process.
+	go cmd.Wait()
 
 	return vp, nil
 }

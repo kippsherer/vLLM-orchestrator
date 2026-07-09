@@ -419,7 +419,46 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		me.lastCompleted = time.Now()
 		me.mu.Unlock()
 		log.Printf("[orchestrator] %s: → ACTIVE", me.cfg.Name)
+		go o.watchHealth(me, proc)
 		o.drainQueue(me)
+	}
+}
+
+// watchHealth polls GET /health every 10s while proc is the active process for me.
+// On 3 consecutive failures it invokes the crash handler (onExit).
+func (o *orchestrator) watchHealth(me *modelEntry, proc *vllmProcess) {
+	const interval = 10 * time.Second
+	const maxFails = 3
+	fails := 0
+	for {
+		time.Sleep(interval)
+		me.mu.Lock()
+		if me.proc != proc {
+			me.mu.Unlock()
+			return // a new process took over or model was unloaded deliberately
+		}
+		s := me.state
+		me.mu.Unlock()
+
+		if s == stateUnloaded || s == stateLoading {
+			return
+		}
+
+		resp, err := proc.client.Get("http://vllm/health")
+		if err == nil {
+			resp.Body.Close()
+			fails = 0
+			continue
+		}
+		fails++
+		log.Printf("[orchestrator] %s: health check failed (%d/%d): %v", me.cfg.Name, fails, maxFails, err)
+		if fails >= maxFails {
+			log.Printf("[orchestrator] %s: health check failed %d times → UNLOADED", me.cfg.Name, maxFails)
+			if proc.onExit != nil {
+				proc.onExit()
+			}
+			return
+		}
 	}
 }
 
