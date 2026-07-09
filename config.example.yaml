@@ -1,0 +1,49 @@
+listen: ":8000"
+vllm_socket_dir: "/run/vllm"
+queue_depth: 100
+
+ttl_active: 10m
+ttl_inactive: 60m
+ttl_unused: 120m
+
+gpu_groups:
+  - id: "group0"
+    gpus: [0, 1, 2, 3]       # CUDA device IDs in this group
+                               # Total VRAM is measured from nvidia-smi at startup
+
+  - id: "group1"
+    gpus: [4]                  # Single-GPU group example
+
+models:
+  - name: "meta-llama/Meta-Llama-3-8B-Instruct"
+    aliases: ["llama3-8b", "llama3"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=float16"
+      - "--max-model-len=8192"
+      - "--enable-prefix-caching"
+      - "--tool-call-parser=hermes"
+
+  - name: "mistralai/Mistral-7B-Instruct-v0.3"
+    aliases: ["mistral-7b", "mistral"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=float16"
+      - "--max-model-len=32768"
+
+  # AWQ quantized example — lower VRAM footprint
+  - name: "casperhansen/llama-3-70b-instruct-awq"
+    aliases: ["llama3-70b-awq"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=auto"
+      - "--quantization=awq"
+      - "--max-model-len=8192"
+
+  # Vision-language model example
+  - name: "llava-hf/llava-1.5-7b-hf"
+    aliases: ["llava"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=float16"
+      - "--max-model-len=4096"
