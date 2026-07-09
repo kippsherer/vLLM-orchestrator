@@ -104,9 +104,10 @@ func buildEnv(cudaVisible string) []string {
 
 // drainAndMeasure reads stdout, logs each line tagged with modelName, and
 // parses memory measurement lines into mem. measured is set true when both
-// values are found.
+// values are found. Stdout is always drained to EOF regardless of measurement status.
 func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurement bool) {
-	deadline := time.Now().Add(60 * time.Second)
+	warnDeadline := time.Now().Add(3600 * time.Second)
+	warnFired := false
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
@@ -127,9 +128,10 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurem
 				mem.measured = true
 			}
 		}
-		if !mem.measured && time.Now().After(deadline) {
-			log.Printf("[vllm/%s] WARNING: memory values not found within 60s; retaining placeholder", modelName)
-			break
+		if !mem.measured && !warnFired && time.Now().After(warnDeadline) {
+			log.Printf("[vllm/%s] WARNING: memory values not found within 3600s; retaining placeholder", modelName)
+			warnFired = true
+			// Continue draining — do not break.
 		}
 	}
 	// drain remaining lines even after measurement complete or deadline
@@ -146,10 +148,10 @@ func drainLog(r io.Reader, modelName string) {
 	}
 }
 
-// waitForHealth polls GET /health on the vLLM process until 200 or 300s timeout.
+// waitForHealth polls GET /health on the vLLM process until 200 or 3600s timeout.
 // Returns nil when ready. On timeout, kills the process and removes the socket.
 func waitForHealth(vp *vllmProcess, modelName string) error {
-	deadline := time.Now().Add(300 * time.Second)
+	deadline := time.Now().Add(3600 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := vp.client.Get("http://vllm/health")
 		if err == nil {

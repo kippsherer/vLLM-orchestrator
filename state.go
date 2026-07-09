@@ -39,8 +39,10 @@ func (s modelState) String() string {
 type requestPair struct {
 	w http.ResponseWriter
 	r *http.Request
-	// done is closed by the controller when the request may be forwarded.
+	// done is closed by the controller when the request may be forwarded or rejected.
+	// err is set before closing done when the request is rejected with a 503.
 	done chan struct{}
+	err  bool // true means 503 was already written; caller must not forward
 }
 
 // modelEntry is the full runtime record for one model.
@@ -55,7 +57,8 @@ type modelEntry struct {
 	activeRequests   int
 	queue            chan requestPair
 	lastCompleted    time.Time
-	assignedGroupIdx int // index into memoryState.groups; -1 if unassigned
+	assignedGroupIdx int   // index into memoryState.groups; -1 if unassigned
+	reservedVRAMMB   int64 // VRAM MB reserved at launch time (placeholder or actual)
 }
 
 // orchestrator is the top-level runtime that owns all model entries and memory.
@@ -175,17 +178,14 @@ func (o *orchestrator) tickTTL(me *modelEntry) {
 		me.state = stateUnloaded
 		me.proc = nil
 		me.assignedGroupIdx = -1
+		me.reservedVRAMMB = 0
 		me.mu.Unlock()
 
 		if proc != nil {
 			killProcess(proc, me.cfg.Name)
 		}
-		if groupIdx >= 0 {
-			o.ms.mu.Lock()
-			// SLEEP2 holds no VRAM (already released), nothing to restore here.
-			o.ms.mu.Unlock()
-		}
 		log.Printf("[orchestrator] %s: SLEEP2 → UNLOADED (ttl_unused elapsed)", me.cfg.Name)
+		_ = groupIdx // SLEEP2 holds no VRAM in accounting
 	}
 }
 
@@ -210,25 +210,27 @@ func (o *orchestrator) transitionToSleep(me *modelEntry, proc *vllmProcess, leve
 
 	prevState := me.state
 	groupIdx := me.assignedGroupIdx
+	reserved := me.reservedVRAMMB
+	weightsVRAM := me.mem.weightsVRAMMB
 
 	o.ms.mu.Lock()
 	switch {
 	case prevState == stateActive && level == 1:
 		// Release VRAM; charge CPU RAM.
 		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB -= me.mem.fullKVVRAMMB
+			o.ms.groups[groupIdx].usedVRAMMB -= reserved
 		}
-		o.ms.freeCPURAMB -= me.mem.weightsVRAMMB
+		o.ms.freeCPURAMB -= weightsVRAM
 		me.state = stateSleep1
 	case prevState == stateActive && level == 2:
 		// Release VRAM; no CPU RAM charged.
 		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB -= me.mem.fullKVVRAMMB
+			o.ms.groups[groupIdx].usedVRAMMB -= reserved
 		}
 		me.state = stateSleep2
 	case prevState == stateSleep1 && level == 2:
-		// Release CPU RAM.
-		o.ms.freeCPURAMB += me.mem.weightsVRAMMB
+		// Release CPU RAM only (VRAM already released on SLEEP1 entry).
+		o.ms.freeCPURAMB += weightsVRAM
 		me.state = stateSleep2
 	}
 	o.ms.mu.Unlock()
@@ -259,17 +261,20 @@ func (o *orchestrator) wakeAndActivate(me *modelEntry) error {
 		return nil
 	}
 
+	reserved := me.reservedVRAMMB
+	weightsVRAM := me.mem.weightsVRAMMB
+
 	o.ms.mu.Lock()
 	if prevState == stateSleep1 {
 		// Restore VRAM; release CPU RAM.
 		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB += me.mem.fullKVVRAMMB
+			o.ms.groups[groupIdx].usedVRAMMB += reserved
 		}
-		o.ms.freeCPURAMB += me.mem.weightsVRAMMB
+		o.ms.freeCPURAMB += weightsVRAM
 	} else {
 		// SLEEP2: restore VRAM only.
 		if groupIdx >= 0 {
-			o.ms.groups[groupIdx].usedVRAMMB += me.mem.fullKVVRAMMB
+			o.ms.groups[groupIdx].usedVRAMMB += reserved
 		}
 	}
 	o.ms.mu.Unlock()
@@ -349,11 +354,13 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		if err != nil {
 			log.Printf("[orchestrator] %s: launch failed: %v", me.cfg.Name, err)
 			me.mu.Lock()
+			reserved := me.reservedVRAMMB
 			me.state = stateUnloaded
 			me.assignedGroupIdx = -1
+			me.reservedVRAMMB = 0
 			me.mu.Unlock()
 			o.ms.mu.Lock()
-			o.ms.groups[groupIdx].usedVRAMMB -= placeholderVRAM(o.ms.groups[groupIdx], &me.mem)
+			o.ms.groups[groupIdx].usedVRAMMB -= reserved
 			o.ms.mu.Unlock()
 			o.drainQueueWith503(me)
 			return
@@ -367,12 +374,14 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		if err := waitForHealth(proc, me.cfg.Name); err != nil {
 			log.Printf("[orchestrator] %s: health poll failed: %v", me.cfg.Name, err)
 			me.mu.Lock()
+			reserved := me.reservedVRAMMB
 			me.state = stateUnloaded
 			me.proc = nil
 			me.assignedGroupIdx = -1
+			me.reservedVRAMMB = 0
 			me.mu.Unlock()
 			o.ms.mu.Lock()
-			o.ms.groups[groupIdx].usedVRAMMB -= placeholderVRAM(o.ms.groups[groupIdx], &me.mem)
+			o.ms.groups[groupIdx].usedVRAMMB -= reserved
 			o.ms.mu.Unlock()
 			o.drainQueueWith503(me)
 			return
@@ -396,16 +405,19 @@ func (o *orchestrator) refineMeasuredVRAM(me *modelEntry, groupIdx int) {
 	me.mu.Lock()
 	measured := me.mem.measured
 	actual := me.mem.fullKVVRAMMB
+	reserved := me.reservedVRAMMB
 	me.mu.Unlock()
 
-	if !measured {
+	if !measured || actual == reserved {
 		return
 	}
 	o.ms.mu.Lock()
-	gs := o.ms.groups[groupIdx]
-	placeholder := placeholderVRAM(gs, &me.mem)
-	gs.usedVRAMMB = gs.usedVRAMMB - placeholder + actual
+	o.ms.groups[groupIdx].usedVRAMMB = o.ms.groups[groupIdx].usedVRAMMB - reserved + actual
 	o.ms.mu.Unlock()
+
+	me.mu.Lock()
+	me.reservedVRAMMB = actual
+	me.mu.Unlock()
 }
 
 // placeholderVRAM returns group.measuredTotalVRAMMB * 0.85 as the placeholder
@@ -433,12 +445,15 @@ func (o *orchestrator) drainQueue(me *modelEntry) {
 	}
 }
 
-// drainQueueWith503 writes 503 to all waiting requestPairs in me.queue.
+// drainQueueWith503 writes 503 to all waiting requestPairs in me.queue
+// and closes their done channels so callers unblock immediately.
 func (o *orchestrator) drainQueueWith503(me *modelEntry) {
 	for {
 		select {
 		case rp := <-me.queue:
 			http.Error(rp.w, "service unavailable", http.StatusServiceUnavailable)
+			rp.err = true
+			close(rp.done)
 		default:
 			return
 		}

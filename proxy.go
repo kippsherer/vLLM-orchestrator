@@ -115,14 +115,17 @@ func (o *orchestrator) routeRequest(w http.ResponseWriter, r *http.Request, me *
 	rp := requestPair{w: w, r: r, done: make(chan struct{})}
 	o.handleRequest(me, rp)
 
-	// Wait for done signal (ACTIVE) or check if 503 was already written.
 	select {
 	case <-rp.done:
 	case <-r.Context().Done():
 		return
 	}
 
-	// Request is now allowed through; forward it.
+	// rp.err means 503 was already written by drainQueueWith503; do not forward.
+	if rp.err {
+		return
+	}
+
 	o.forwardDirect(w, r, me)
 	o.completeRequest(me)
 }
@@ -349,6 +352,9 @@ func (o *orchestrator) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-rp.done:
 	case <-r.Context().Done():
+		return
+	}
+	if rp.err {
 		return
 	}
 	defer o.completeRequest(me)

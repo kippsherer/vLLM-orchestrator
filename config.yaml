@@ -1,0 +1,59 @@
+listen: ":8000"
+vllm_socket_dir: "/run/vllm"
+queue_depth: 100
+
+ttl_active: 10m
+ttl_inactive: 60m
+ttl_unused: 120m
+
+gpu_groups:
+  - id: "group0"
+    gpus: [0, 1]
+
+models:
+  - name: "Qwen/Qwen2.5-32B-Instruct-AWQ"
+    aliases: ["qwen2.5-32b", "qwen2.5-32b-awq"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=auto"
+      - "--quantization=awq"
+      - "--max-model-len=16384"
+      - "--enable-prefix-caching"
+      - "--tool-call-parser=hermes"
+
+  - name: "Qwen/Qwen3-14B"
+    aliases: ["qwen3-14b"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=bfloat16"
+      - "--max-model-len=32768"
+      - "--enable-prefix-caching"
+      - "--tool-call-parser=hermes"
+
+  - name: "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+    aliases: ["deepseek-coder", "deepseek-coder-v2-lite"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=bfloat16"
+      - "--max-model-len=32768"
+      - "--enable-prefix-caching"
+      - "--trust-remote-code"
+
+  - name: "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"
+    aliases: ["qwen2.5-coder-32b", "qwen-coder"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=auto"
+      - "--quantization=awq"
+      - "--max-model-len=16384"
+      - "--enable-prefix-caching"
+      - "--tool-call-parser=hermes"
+
+  - name: "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
+    aliases: ["qwen3-vl", "qwen3-vl-8b"]
+    load_at_startup: false
+    vllm_args:
+      - "--dtype=auto"
+      - "--quantization=awq"
+      - "--max-model-len=8192"
+      - "--enable-prefix-caching"

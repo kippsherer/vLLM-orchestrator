@@ -81,7 +81,7 @@ func TestParseNvidiaSmi(t *testing.T) {
 }
 
 func TestInitMemory(t *testing.T) {
-	t.Parallel()
+	// Subtests mutate package-level func vars; cannot run in parallel.
 
 	cfg := &Config{
 		GPUGroups: []GPUGroup{
@@ -91,7 +91,6 @@ func TestInitMemory(t *testing.T) {
 	}
 
 	t.Run("valid", func(t *testing.T) {
-		t.Parallel()
 		orig := queryNvidiaSmi
 		origMem := readMemAvailableMB
 		t.Cleanup(func() { queryNvidiaSmi = orig; readMemAvailableMB = origMem })
@@ -118,7 +117,6 @@ func TestInitMemory(t *testing.T) {
 	})
 
 	t.Run("nvidia_smi_error", func(t *testing.T) {
-		t.Parallel()
 		orig := queryNvidiaSmi
 		t.Cleanup(func() { queryNvidiaSmi = orig })
 		queryNvidiaSmi = func() (string, error) { return "", errTest("nvidia-smi failed") }
@@ -142,7 +140,6 @@ func TestInitMemory(t *testing.T) {
 	})
 
 	t.Run("gpu_id_not_in_smi", func(t *testing.T) {
-		t.Parallel()
 		orig := queryNvidiaSmi
 		origMem := readMemAvailableMB
 		t.Cleanup(func() { queryNvidiaSmi = orig; readMemAvailableMB = origMem })
@@ -160,7 +157,6 @@ func TestInitMemory(t *testing.T) {
 	})
 
 	t.Run("meminfo_error", func(t *testing.T) {
-		t.Parallel()
 		orig := queryNvidiaSmi
 		origMem := readMemAvailableMB
 		t.Cleanup(func() { queryNvidiaSmi = orig; readMemAvailableMB = origMem })
