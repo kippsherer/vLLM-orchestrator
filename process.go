@@ -18,8 +18,8 @@ import (
 )
 
 var (
-	reWeights = regexp.MustCompile(`Loading model weights took\s+([\d.]+)\s*GB`)
-	reKVCache = regexp.MustCompile(`GPU KV cache size:\s+([\d.]+)\s*GB`)
+	reWeights = regexp.MustCompile(`Model loading took\s+([\d.]+)\s*GiB`)
+	reKVCache = regexp.MustCompile(`Available KV cache memory:\s+([\d.]+)\s*GiB`)
 )
 
 // vllmProcess represents a running vLLM subprocess for one model.

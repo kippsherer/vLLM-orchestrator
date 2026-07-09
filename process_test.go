@@ -63,8 +63,8 @@ func TestDrainAndMeasure(t *testing.T) {
 			drainAndMeasure(pr, "test-model", mem, true)
 			close(done)
 		}()
-		pw.Write([]byte("Loading model weights took 7.00 GB\n"))
-		pw.Write([]byte("GPU KV cache size: 5.00 GB\n"))
+		pw.Write([]byte("INFO [model_runner.py:295] Model loading took 7.00 GiB and 7.8 seconds\n"))
+		pw.Write([]byte("INFO [gpu_worker.py:466] Available KV cache memory: 5.00 GiB\n"))
 		pw.Close()
 		<-done
 

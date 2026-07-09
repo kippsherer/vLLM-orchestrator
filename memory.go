@@ -17,6 +17,7 @@ type groupState struct {
 	gpus                []int
 	measuredTotalVRAMMB int64 // from nvidia-smi at startup
 	usedVRAMMB          int64 // sum of reservedVRAMMB for LOADING+ACTIVE models on this group
+	measuredFreeMB      int64 // actual free VRAM from nvidia-smi; -1 until first refreshMemory call
 }
 
 // freeVRAMMB returns measuredTotalVRAMMB minus usedVRAMMB, floored at 0.
@@ -42,7 +43,7 @@ type modelMemory struct {
 	measured      bool
 }
 
-// queryNvidiaSmi is the function used to obtain nvidia-smi output.
+// queryNvidiaSmi is the function used to obtain nvidia-smi total-memory output.
 // Replaced in tests via assignment.
 var queryNvidiaSmi = func() (string, error) {
 	out, err := runCommand("nvidia-smi",
@@ -50,6 +51,18 @@ var queryNvidiaSmi = func() (string, error) {
 		"--format=csv,noheader,nounits")
 	if err != nil {
 		return "", fmt.Errorf("nvidia-smi: %w", err)
+	}
+	return out, nil
+}
+
+// queryNvidiaSmiFreeMB is the function used to obtain nvidia-smi free-memory output.
+// Replaced in tests via assignment.
+var queryNvidiaSmiFreeMB = func() (string, error) {
+	out, err := runCommand("nvidia-smi",
+		"--query-gpu=index,memory.free",
+		"--format=csv,noheader,nounits")
+	if err != nil {
+		return "", fmt.Errorf("nvidia-smi free: %w", err)
 	}
 	return out, nil
 }
@@ -172,20 +185,11 @@ func startPeriodicMemoryRefresh(ms *memoryState) {
 }
 
 func refreshMemory(ms *memoryState) {
-	smiOut, err := queryNvidiaSmi()
-	if err != nil {
-		log.Printf("memory refresh: nvidia-smi error: %v", err)
-		return
-	}
-	// nvidia-smi free memory query
-	freeOut, err := runCommand("nvidia-smi",
-		"--query-gpu=index,memory.free",
-		"--format=csv,noheader,nounits")
+	freeOut, err := queryNvidiaSmiFreeMB()
 	if err != nil {
 		log.Printf("memory refresh: nvidia-smi free query error: %v", err)
 		return
 	}
-	_ = smiOut
 	freeByDev, err := parseNvidiaSmi(freeOut)
 	if err != nil {
 		log.Printf("memory refresh: parse free VRAM: %v", err)
