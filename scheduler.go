@@ -65,8 +65,8 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 		if idx < 0 {
 			o.ms.mu.RLock()
 			for _, gs := range o.ms.groups {
-				log.Printf("[scheduler] assignGroup fail: group %s free=%dMB pending=%dMB needed=%dMB",
-					gs.id, gs.measuredFreeMB, gs.pendingVRAMMB, needed)
+				log.Printf("[scheduler] assignGroup fail: group %s free=%dMB needed=%dMB",
+					gs.id, gs.measuredFreeMB, needed)
 			}
 			o.ms.mu.RUnlock()
 			return -1, fmt.Errorf("assign group: insufficient VRAM for %d MB after freeing", needed)
@@ -74,9 +74,6 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	}
 
 	me.reservedVRAMMB = needed
-	o.ms.mu.Lock()
-	o.ms.groups[idx].pendingVRAMMB += needed
-	o.ms.mu.Unlock()
 	return idx, nil
 }
 
@@ -86,7 +83,7 @@ func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
 	best := -1
 	var bestTotal int64
 	for i, gs := range o.ms.groups {
-		if gs.measuredFreeMB-gs.pendingVRAMMB >= neededMB {
+		if gs.measuredFreeMB >= neededMB {
 			if best < 0 || gs.measuredTotalVRAMMB < bestTotal {
 				best = i
 				bestTotal = gs.measuredTotalVRAMMB
@@ -152,10 +149,9 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		refreshMemory(o.ms)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
-		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
-		log.Printf("[scheduler] rule1: free %dMB → %dMB (pending %dMB)  %s  ACTIVE → SLEEP1", freeBefore, free, pending, me.cfg.Name)
-		if free-pending >= neededMB {
+		log.Printf("[scheduler] rule1: free %dMB → %dMB (needed %dMB)  %s  ACTIVE → SLEEP1", freeBefore, free, neededMB, me.cfg.Name)
+		if free >= neededMB {
 			return true
 		}
 	}
@@ -168,6 +164,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 			continue
 		}
 		proc := me.proc
+		expectedMB := me.reservedVRAMMB
 		me.state = stateUnloaded
 		me.proc = nil
 		me.reservedVRAMMB = 0
@@ -179,13 +176,12 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		o.ms.mu.RUnlock()
 
 		killProcess(proc, me.cfg.Name)
-		waitVRAMStable(o.ms, gs)
+		waitVRAMStable(o.ms, gs, freeBefore, expectedMB)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
-		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
-		log.Printf("[scheduler] rule2: free %dMB → %dMB  %s  SLEEP2 → UNLOADED", freeBefore, free, me.cfg.Name)
-		if free-pending >= neededMB {
+		log.Printf("[scheduler] rule2: free %dMB → %dMB (needed %dMB)  %s  SLEEP2 → UNLOADED", freeBefore, free, neededMB, me.cfg.Name)
+		if free >= neededMB {
 			return true
 		}
 	}
@@ -215,10 +211,9 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		refreshMemory(o.ms)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
-		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
-		log.Printf("[scheduler] rule3: free %dMB → %dMB (pending %dMB)  %s  SLEEP1 → SLEEP2", freeBefore, free, pending, me.cfg.Name)
-		if free-pending >= neededMB {
+		log.Printf("[scheduler] rule3: free %dMB → %dMB (needed %dMB)  %s  SLEEP1 → SLEEP2", freeBefore, free, neededMB, me.cfg.Name)
+		if free >= neededMB {
 			return true
 		}
 	}
@@ -231,6 +226,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 			continue
 		}
 		proc := me.proc
+		expectedMB := me.reservedVRAMMB
 		me.state = stateUnloaded
 		me.proc = nil
 		me.reservedVRAMMB = 0
@@ -242,13 +238,12 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 		o.ms.mu.RUnlock()
 
 		killProcess(proc, me.cfg.Name)
-		waitVRAMStable(o.ms, gs)
+		waitVRAMStable(o.ms, gs, freeBefore, expectedMB)
 		o.ms.mu.RLock()
 		free := gs.measuredFreeMB
-		pending := gs.pendingVRAMMB
 		o.ms.mu.RUnlock()
-		log.Printf("[scheduler] rule4: free %dMB → %dMB (pending %dMB)  %s  SLEEP2 → UNLOADED", freeBefore, free, pending, me.cfg.Name)
-		if free-pending >= neededMB {
+		log.Printf("[scheduler] rule4: free %dMB → %dMB (needed %dMB)  %s  SLEEP2 → UNLOADED", freeBefore, free, neededMB, me.cfg.Name)
+		if free >= neededMB {
 			return true
 		}
 	}
@@ -287,11 +282,18 @@ func (o *orchestrator) freeCPURam(neededCPUMB int64) {
 	}
 }
 
-// waitVRAMStable polls nvidia-smi after a process kill until measuredFreeMB
-// stops increasing between consecutive reads (500ms apart), or 10 seconds elapse.
-// This replaces a fixed sleep and ensures the GPU driver has finished reclaiming
-// memory before the caller checks whether enough is free.
-func waitVRAMStable(ms *memoryState, gs *groupState) {
+// waitVRAMStable polls nvidia-smi after a process kill until the GPU group has
+// reclaimed at least 75% of expectedMB (measured from freeBefore) AND free VRAM
+// has not changed by more than 1% of expectedMB between consecutive 500ms reads.
+// This avoids both false-early-exit (nvidia-smi momentary plateau before driver
+// finishes releasing NCCL/graph-pool memory) and infinite wait on a busy server
+// where VRAM usage is never perfectly flat. Deadline is 30 seconds.
+func waitVRAMStable(ms *memoryState, gs *groupState, freeBefore, expectedMB int64) {
+	threshold75 := freeBefore + (expectedMB*75)/100
+	jitter := expectedMB / 100 // 1% of expected as noise floor
+	if jitter < 10 {
+		jitter = 10 // minimum 10 MB noise floor
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	ms.mu.RLock()
 	prev := gs.measuredFreeMB
@@ -302,11 +304,18 @@ func waitVRAMStable(ms *memoryState, gs *groupState) {
 		ms.mu.RLock()
 		cur := gs.measuredFreeMB
 		ms.mu.RUnlock()
-		if cur <= prev {
+		if cur >= threshold75 && abs64(cur-prev) <= jitter {
 			return
 		}
 		prev = cur
 	}
+}
+
+func abs64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // idleActiveModels returns idle ACTIVE models sorted smallest fullKVVRAMMB first.

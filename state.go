@@ -334,12 +334,8 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 			me.mu.Lock()
 			me.state = stateUnloaded
 			me.assignedGroupIdx = -1
-			reserved := me.reservedVRAMMB
 			me.reservedVRAMMB = 0
 			me.mu.Unlock()
-			o.ms.mu.Lock()
-			o.ms.groups[groupIdx].pendingVRAMMB -= reserved
-			o.ms.mu.Unlock()
 			o.drainQueueWith503(me)
 			return
 		}
@@ -358,16 +354,9 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 			}
 			me.state = stateUnloaded
 			me.proc = nil
-			gIdx := me.assignedGroupIdx
-			reserved := me.reservedVRAMMB
 			me.assignedGroupIdx = -1
 			me.reservedVRAMMB = 0
 			me.mu.Unlock()
-			if gIdx >= 0 {
-				o.ms.mu.Lock()
-				o.ms.groups[gIdx].pendingVRAMMB -= reserved
-				o.ms.mu.Unlock()
-			}
 			log.Printf("[orchestrator] %s: process exited unexpectedly → UNLOADED", me.cfg.Name)
 			o.drainQueueWith503(me)
 		}
@@ -377,13 +366,9 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 			me.mu.Lock()
 			me.state = stateUnloaded
 			me.proc = nil
-			reserved := me.reservedVRAMMB
 			me.assignedGroupIdx = -1
 			me.reservedVRAMMB = 0
 			me.mu.Unlock()
-			o.ms.mu.Lock()
-			o.ms.groups[groupIdx].pendingVRAMMB -= reserved
-			o.ms.mu.Unlock()
 			o.drainQueueWith503(me)
 			return
 		}
@@ -396,15 +381,10 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 		me.mu.Unlock()
 
 		me.mu.Lock()
-		reserved := me.reservedVRAMMB
 		me.reservedVRAMMB = 0
 		me.state = stateActive
 		me.lastCompleted = time.Now()
 		me.mu.Unlock()
-		// Release the pending reservation — nvidia-smi now reflects the actual usage.
-		o.ms.mu.Lock()
-		o.ms.groups[groupIdx].pendingVRAMMB -= reserved
-		o.ms.mu.Unlock()
 		log.Printf("[orchestrator] %s: → ACTIVE", me.cfg.Name)
 		go o.watchHealth(me, proc)
 		o.drainQueue(me)
