@@ -188,7 +188,7 @@ Each entry includes a non-standard `orchestrator_state` field (`"active"`, `"sle
 The orchestrator maintains software VRAM and CPU RAM accounting:
 
 - **VRAM** per GPU group: measured from `nvidia-smi` at startup; re-queried every 60 seconds.
-- **Model VRAM** (`weights + KV cache`): parsed from vLLM's stdout on first launch (`"Loading model weights took X.XX GB"` and `"GPU KV cache size: X.XX GB"`). Before the first launch, a placeholder of `group_total × 0.85` is used for scheduling.
+- **Model VRAM** (`weights + KV cache`): parsed from vLLM's stdout on first launch (`"Model loading took X.XX GiB"` and `"Available KV cache memory: X.XX GiB"`). Before the first launch, a placeholder of `group_total × 0.85` is used for scheduling.
 - **CPU RAM**: read from `/proc/meminfo` (`MemAvailable`) at startup; re-read every 60 seconds. Used to decide whether a sleeping model's weights can be offloaded to CPU (`SLEEP1`) or must be discarded (`SLEEP2`).
 
 When memory is needed to load a new model, the orchestrator runs freeing rules in order:
@@ -223,5 +223,3 @@ gofmt -w .             # format
 goimports -w .         # fix imports
 go vet ./...           # vet
 ```
-
-`go build` and `go test -c` are not used in this project. Use `go run .` to run directly.
