@@ -115,7 +115,11 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurem
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
-		log.Printf("[vllm/%s] %s", modelName, line)
+		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") {
+			log.Printf("[vllm/%s] %s", modelName, line)
+		} else {
+			logVerbose("[vllm/%s] %s", modelName, line)
+		}
 		if !isMeasurement || mem.measured {
 			continue
 		}
@@ -140,7 +144,12 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurem
 	}
 	// drain remaining lines even after measurement complete or deadline
 	for sc.Scan() {
-		log.Printf("[vllm/%s] %s", modelName, sc.Text())
+		line := sc.Text()
+		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") {
+			log.Printf("[vllm/%s] %s", modelName, line)
+		} else {
+			logVerbose("[vllm/%s] %s", modelName, line)
+		}
 	}
 }
 
@@ -148,7 +157,12 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurem
 func drainLog(r io.Reader, modelName string) {
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
-		log.Printf("[vllm/%s] %s", modelName, sc.Text())
+		line := sc.Text()
+		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") {
+			log.Printf("[vllm/%s] %s", modelName, line)
+		} else {
+			logVerbose("[vllm/%s] %s", modelName, line)
+		}
 	}
 }
 

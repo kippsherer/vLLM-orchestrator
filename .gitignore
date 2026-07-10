@@ -27,6 +27,12 @@ go.work.sum
 # env file
 .env
 
+# Local config (use config.example.yaml as template)
+config.yaml
+
+# Agent instructions
+AGENTS.md
+
 # Editor/IDE
 # .idea/
 # .vscode/

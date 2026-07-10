@@ -13,8 +13,17 @@ import (
 	"time"
 )
 
+var verbose bool
+
+func logVerbose(format string, args ...any) {
+	if verbose {
+		log.Printf(format, args...)
+	}
+}
+
 func main() {
 	configPath := flag.String("config", "", "path to YAML config file")
+	flag.BoolVar(&verbose, "verbose", false, "enable verbose logging")
 	flag.Parse()
 
 	if *configPath == "" {

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -150,7 +149,7 @@ func (o *orchestrator) forwardDirect(w http.ResponseWriter, r *http.Request, me 
 		Transport:     transport,
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("[proxy] %s upstream error: %v", me.cfg.Name, err)
+			logVerbose("[proxy] %s upstream error: %v", me.cfg.Name, err)
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		},
 	}
@@ -369,7 +368,7 @@ func (o *orchestrator) serveModels(w http.ResponseWriter, r *http.Request) {
 func fetchLiveModels(proc *vllmProcess, modelName string) []json.RawMessage {
 	resp, err := proc.client.Get("http://vllm/v1/models")
 	if err != nil {
-		log.Printf("[proxy] fetchLiveModels %s: %v", modelName, err)
+		logVerbose("[proxy] fetchLiveModels %s: %v", modelName, err)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -377,7 +376,7 @@ func fetchLiveModels(proc *vllmProcess, modelName string) []json.RawMessage {
 		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		log.Printf("[proxy] fetchLiveModels %s decode: %v", modelName, err)
+		logVerbose("[proxy] fetchLiveModels %s decode: %v", modelName, err)
 		return nil
 	}
 	return out.Data
