@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -174,5 +176,245 @@ func TestDrainQueue(t *testing.T) {
 	}
 	if len(me.queue) != 0 {
 		t.Errorf("queue not drained: %d items remain", len(me.queue))
+	}
+}
+
+func TestHandleRequestActiveImmediate(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+	me := o.models[0]
+
+	me.mu.Lock()
+	me.state = stateActive
+	me.mu.Unlock()
+
+	errFlag := false
+	rp := requestPair{
+		w:    httptest.NewRecorder(),
+		r:    &http.Request{},
+		done: make(chan struct{}),
+		err:  &errFlag,
+	}
+
+	o.handleRequest(me, rp)
+
+	select {
+	case <-rp.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for done")
+	}
+
+	if errFlag {
+		t.Error("errFlag should be false")
+	}
+}
+
+func TestHandleRequestQueueFull(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+
+	me := &modelEntry{
+		cfg:              ModelConfig{Name: "test-model"},
+		state:            stateUnloaded,
+		queue:            make(chan requestPair, 1),
+		lastCompleted:    time.Now(),
+		assignedGroupIdx: -1,
+	}
+
+	occupyingErr := false
+	me.queue <- requestPair{
+		w:    httptest.NewRecorder(),
+		r:    &http.Request{},
+		done: make(chan struct{}),
+		err:  &occupyingErr,
+	}
+
+	rec := httptest.NewRecorder()
+	errFlag := false
+	rp := requestPair{
+		w:    rec,
+		r:    &http.Request{},
+		done: make(chan struct{}),
+		err:  &errFlag,
+	}
+
+	o.handleRequest(me, rp)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("got status %d, want 503", rec.Code)
+	}
+}
+
+func TestHandleRequestLoadingWait(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+	me := o.models[0]
+
+	me.mu.Lock()
+	me.state = stateLoading
+	me.mu.Unlock()
+
+	errFlag := false
+	rp := requestPair{
+		w:    httptest.NewRecorder(),
+		r:    &http.Request{},
+		done: make(chan struct{}),
+		err:  &errFlag,
+	}
+
+	go o.handleRequest(me, rp)
+
+	time.Sleep(500 * time.Millisecond)
+
+	me.mu.Lock()
+	me.state = stateActive
+	me.mu.Unlock()
+
+	select {
+	case <-rp.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for done")
+	}
+
+	if errFlag {
+		t.Error("errFlag should be false")
+	}
+}
+
+func TestHandleRequestSleepWake(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+	me := o.models[0]
+
+	socketPath := t.TempDir() + "/test.sock"
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/wake_up", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/is_sleeping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"is_sleeping":false}`))
+	})
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(listener)
+	t.Cleanup(func() { srv.Close() })
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	vp := &vllmProcess{
+		socketPath: socketPath,
+		client:     client,
+	}
+
+	me.mu.Lock()
+	me.state = stateSleep1
+	me.proc = vp
+	me.mu.Unlock()
+
+	errFlag := false
+	rp := requestPair{
+		w:    httptest.NewRecorder(),
+		r:    &http.Request{},
+		done: make(chan struct{}),
+		err:  &errFlag,
+	}
+
+	o.handleRequest(me, rp)
+
+	select {
+	case <-rp.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for done")
+	}
+
+	me.mu.Lock()
+	st := me.state
+	me.mu.Unlock()
+	if st != stateActive {
+		t.Errorf("state = %s, want active", st)
+	}
+}
+
+func TestTickTTLActive(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+	me := o.models[0]
+
+	socketPath := t.TempDir() + "/test.sock"
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sleep", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/is_sleeping", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"is_sleeping":true}`))
+	})
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(listener)
+	t.Cleanup(func() { srv.Close() })
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	vp := &vllmProcess{
+		socketPath: socketPath,
+		client:     client,
+	}
+
+	me.mu.Lock()
+	me.state = stateActive
+	me.activeRequests = 0
+	me.lastCompleted = time.Now().Add(-10 * time.Minute)
+	me.proc = vp
+	me.mem.weightsVRAMMB = 10000
+	me.mu.Unlock()
+
+	o.tickTTL(me)
+
+	me.mu.Lock()
+	st := me.state
+	me.mu.Unlock()
+	if st != stateSleep1 {
+		t.Errorf("state = %s, want sleep1", st)
+	}
+}
+
+func TestTickTTLNotExpired(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+	me := o.models[0]
+
+	me.mu.Lock()
+	me.state = stateActive
+	me.activeRequests = 0
+	me.lastCompleted = time.Now()
+	me.mu.Unlock()
+
+	o.tickTTL(me)
+
+	me.mu.Lock()
+	st := me.state
+	me.mu.Unlock()
+	if st != stateActive {
+		t.Errorf("state = %s, want active", st)
 	}
 }

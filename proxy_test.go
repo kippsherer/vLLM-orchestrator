@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExtractModelField(t *testing.T) {
@@ -287,5 +290,323 @@ func TestRewriteModelField(t *testing.T) {
 				t.Errorf("rewriteModelField(%q, %q)\n got  %q\n want %q", tc.input, tc.canonical, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestServeHTTPDocsRoutes(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+
+	routes := []string{"/docs", "/redoc", "/openapi.json"}
+	for _, route := range routes {
+		route := route
+		t.Run(route, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodGet, route, nil)
+			rec := httptest.NewRecorder()
+			o.serveHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("%s: status = %d, want 503", route, rec.Code)
+			}
+		})
+	}
+}
+
+func TestServeHTTPGetMethodRequiresModel(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+
+	t.Run("no_model_param", func(t *testing.T) {
+		t.Parallel()
+		req := httptest.NewRequest(http.MethodGet, "/v1/completions", nil)
+		rec := httptest.NewRecorder()
+		o.serveHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", rec.Code)
+		}
+	})
+
+	t.Run("unknown_model", func(t *testing.T) {
+		t.Parallel()
+		req := httptest.NewRequest(http.MethodGet, "/v1/completions?model=unknown", nil)
+		rec := httptest.NewRecorder()
+		o.serveHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", rec.Code)
+		}
+	})
+}
+
+func TestPeekAndResolve(t *testing.T) {
+	t.Parallel()
+	o := makeTestOrchestrator(t)
+
+	t.Run("nil_body", func(t *testing.T) {
+		t.Parallel()
+		req := &http.Request{Body: nil}
+		rec := httptest.NewRecorder()
+		_, _, ok := o.peekAndResolve(rec, req)
+		if ok {
+			t.Error("expected ok=false for nil body")
+		}
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", rec.Code)
+		}
+	})
+
+	t.Run("missing_model_field", func(t *testing.T) {
+		t.Parallel()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"messages":[]}`))
+		rec := httptest.NewRecorder()
+		_, _, ok := o.peekAndResolve(rec, req)
+		if ok {
+			t.Error("expected ok=false for missing model field")
+		}
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400", rec.Code)
+		}
+	})
+
+	t.Run("unknown_model", func(t *testing.T) {
+		t.Parallel()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"model":"no-such-model"}`))
+		rec := httptest.NewRecorder()
+		_, _, ok := o.peekAndResolve(rec, req)
+		if ok {
+			t.Error("expected ok=false for unknown model")
+		}
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", rec.Code)
+		}
+	})
+
+	t.Run("known_canonical", func(t *testing.T) {
+		t.Parallel()
+		body := `{"model":"model-a","prompt":"hi"}`
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		me, buf, ok := o.peekAndResolve(rec, req)
+		if !ok {
+			t.Fatal("expected ok=true for known canonical model")
+		}
+		if me == nil {
+			t.Fatal("expected non-nil modelEntry")
+		}
+		if me.cfg.Name != "model-a" {
+			t.Errorf("model name = %q, want model-a", me.cfg.Name)
+		}
+		if string(buf) != body {
+			t.Errorf("buf = %q, want %q (unchanged)", string(buf), body)
+		}
+	})
+
+	t.Run("alias_model", func(t *testing.T) {
+		t.Parallel()
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"model":"alias-a","prompt":"hi"}`))
+		rec := httptest.NewRecorder()
+		me, buf, ok := o.peekAndResolve(rec, req)
+		if !ok {
+			t.Fatal("expected ok=true for alias model")
+		}
+		if me == nil {
+			t.Fatal("expected non-nil modelEntry")
+		}
+		if me.cfg.Name != "model-a" {
+			t.Errorf("model name = %q, want model-a", me.cfg.Name)
+		}
+		if !strings.Contains(string(buf), `"model":"model-a"`) {
+			t.Errorf("buf %q does not contain rewritten canonical name", string(buf))
+		}
+	})
+}
+
+func TestServeModelsVRAMBranches(t *testing.T) {
+	t.Parallel()
+
+	t.Run("measured_true", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		o.models[0].mu.Lock()
+		o.models[0].mem.measured = true
+		o.models[0].mem.fullKVVRAMMB = 12345
+		o.models[0].assignedGroupIdx = 0
+		o.models[0].mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		rec := httptest.NewRecorder()
+		o.serveModels(rec, req)
+		body := rec.Body.String()
+		if !strings.Contains(body, `"estimated_vram_mb":12345`) {
+			t.Errorf("body %q missing estimated_vram_mb:12345 for measured model", body)
+		}
+	})
+
+	t.Run("measured_false_valid_group", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		o.models[0].mu.Lock()
+		o.models[0].mem.measured = false
+		o.models[0].assignedGroupIdx = 0
+		o.models[0].mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		rec := httptest.NewRecorder()
+		o.serveModels(rec, req)
+		body := rec.Body.String()
+		if !strings.Contains(body, `"estimated_vram_mb":20889`) {
+			t.Errorf("body %q missing estimated_vram_mb:20889 for valid group", body)
+		}
+	})
+
+	t.Run("measured_false_never_launched", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		o.models[0].mu.Lock()
+		o.models[0].mem.measured = false
+		o.models[0].assignedGroupIdx = -1
+		o.models[0].mu.Unlock()
+
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		rec := httptest.NewRecorder()
+		o.serveModels(rec, req)
+		body := rec.Body.String()
+		if !strings.Contains(body, `"estimated_vram_mb":20889`) {
+			t.Errorf("body %q missing estimated_vram_mb:20889 for never launched", body)
+		}
+	})
+}
+
+func TestFetchLiveModels(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+		sockPath := t.TempDir() + "/test.sock"
+		ln, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		t.Cleanup(func() { ln.Close() })
+
+		srv := &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v1/models" {
+					w.Header().Set("Content-Type", "application/json")
+					io.WriteString(w, `{"object":"list","data":[{"id":"m","object":"model"}]}`)
+					return
+				}
+				http.NotFound(w, r)
+			}),
+		}
+		go srv.Serve(ln)
+		t.Cleanup(func() { srv.Close() })
+
+		proc := makeTestVLLMProcess(sockPath)
+
+		var result []json.RawMessage
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			result = fetchLiveModels(proc, "m")
+			if result != nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if result == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if len(result) != 1 {
+			t.Fatalf("got %d entries, want 1", len(result))
+		}
+	})
+
+	t.Run("malformed_json", func(t *testing.T) {
+		t.Parallel()
+		sockPath := t.TempDir() + "/test.sock"
+		ln, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		t.Cleanup(func() { ln.Close() })
+
+		srv := &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				io.WriteString(w, `not json`)
+			}),
+		}
+		go srv.Serve(ln)
+		t.Cleanup(func() { srv.Close() })
+
+		proc := makeTestVLLMProcess(sockPath)
+
+		var result []json.RawMessage
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			result = fetchLiveModels(proc, "m")
+			if result == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		if result != nil {
+			t.Error("expected nil for malformed JSON")
+		}
+	})
+}
+
+func TestForwardToAnyActiveWithActive(t *testing.T) {
+	t.Parallel()
+
+	sockPath := t.TempDir() + "/test.sock"
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	received := make(chan struct{}, 1)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			received <- struct{}{}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			io.WriteString(w, `{"upstream":"ok"}`)
+		}),
+	}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	o := makeTestOrchestrator(t)
+	o.models[0].mu.Lock()
+	o.models[0].state = stateActive
+	o.models[0].socketPath = sockPath
+	o.models[0].mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/docs", nil)
+	rec := httptest.NewRecorder()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec = httptest.NewRecorder()
+		o.forwardToAnyActive(rec, req)
+		if rec.Code == http.StatusOK {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"upstream":"ok"`) {
+		t.Errorf("body %q missing upstream response", rec.Body.String())
+	}
+	select {
+	case <-received:
+	default:
+		t.Error("upstream did not receive the request")
 	}
 }

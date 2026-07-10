@@ -1,7 +1,13 @@
 package main
 
 import (
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestPickGroup(t *testing.T) {
@@ -122,6 +128,518 @@ func TestPlaceholderVRAM(t *testing.T) {
 		want := int64(float64(gs.measuredTotalVRAMMB) * 0.85)
 		if got != want {
 			t.Errorf("placeholderVRAM = %d, want %d", got, want)
+		}
+	})
+}
+
+func TestIdleModels(t *testing.T) {
+	t.Parallel()
+
+	lessByWeights := func(a, b *modelEntry) bool { return a.mem.weightsVRAMMB < b.mem.weightsVRAMMB }
+
+	cases := []struct {
+		name      string
+		setup     func(o *orchestrator)
+		state     modelState
+		less      func(a, b *modelEntry) bool
+		wantNames []string
+	}{
+		{
+			name: "returns only models in requested state with zero active requests",
+			setup: func(o *orchestrator) {
+				o.models[0].mu.Lock()
+				o.models[0].state = stateActive
+				o.models[0].activeRequests = 0
+				o.models[0].mem.weightsVRAMMB = 200
+				o.models[0].mu.Unlock()
+				o.models[1].mu.Lock()
+				o.models[1].state = stateActive
+				o.models[1].activeRequests = 0
+				o.models[1].mem.weightsVRAMMB = 100
+				o.models[1].mu.Unlock()
+			},
+			state:     stateActive,
+			less:      lessByWeights,
+			wantNames: []string{"model-b", "model-a"},
+		},
+		{
+			name: "skips models with active requests",
+			setup: func(o *orchestrator) {
+				o.models[0].mu.Lock()
+				o.models[0].state = stateActive
+				o.models[0].activeRequests = 1
+				o.models[0].mem.weightsVRAMMB = 100
+				o.models[0].mu.Unlock()
+				o.models[1].mu.Lock()
+				o.models[1].state = stateActive
+				o.models[1].activeRequests = 0
+				o.models[1].mem.weightsVRAMMB = 200
+				o.models[1].mu.Unlock()
+			},
+			state:     stateActive,
+			less:      lessByWeights,
+			wantNames: []string{"model-b"},
+		},
+		{
+			name: "skips models in a different state",
+			setup: func(o *orchestrator) {
+				o.models[0].mu.Lock()
+				o.models[0].state = stateActive
+				o.models[0].activeRequests = 0
+				o.models[0].mem.weightsVRAMMB = 100
+				o.models[0].mu.Unlock()
+				o.models[1].mu.Lock()
+				o.models[1].state = stateSleep1
+				o.models[1].activeRequests = 0
+				o.models[1].mem.weightsVRAMMB = 200
+				o.models[1].mu.Unlock()
+			},
+			state:     stateActive,
+			less:      lessByWeights,
+			wantNames: []string{"model-a"},
+		},
+		{
+			name: "sorts by less comparator smallest first",
+			setup: func(o *orchestrator) {
+				o.models[0].mu.Lock()
+				o.models[0].state = stateSleep1
+				o.models[0].activeRequests = 0
+				o.models[0].mem.weightsVRAMMB = 300
+				o.models[0].mu.Unlock()
+				o.models[1].mu.Lock()
+				o.models[1].state = stateSleep1
+				o.models[1].activeRequests = 0
+				o.models[1].mem.weightsVRAMMB = 100
+				o.models[1].mu.Unlock()
+			},
+			state:     stateSleep1,
+			less:      lessByWeights,
+			wantNames: []string{"model-b", "model-a"},
+		},
+		{
+			name: "returns empty slice when nothing matches",
+			setup: func(o *orchestrator) {
+				o.models[0].mu.Lock()
+				o.models[0].state = stateActive
+				o.models[0].activeRequests = 1
+				o.models[0].mu.Unlock()
+				o.models[1].mu.Lock()
+				o.models[1].state = stateSleep2
+				o.models[1].activeRequests = 0
+				o.models[1].mu.Unlock()
+			},
+			state:     stateSleep1,
+			less:      lessByWeights,
+			wantNames: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := makeTestOrchestrator(t)
+			tc.setup(o)
+
+			got := o.idleModels(tc.state, tc.less)
+
+			if len(got) != len(tc.wantNames) {
+				t.Fatalf("idleModels returned %d models, want %d", len(got), len(tc.wantNames))
+			}
+			for i, me := range got {
+				if me.cfg.Name != tc.wantNames[i] {
+					t.Errorf("idleModels[%d] = %q, want %q", i, me.cfg.Name, tc.wantNames[i])
+				}
+			}
+		})
+	}
+}
+
+func TestModelStateString(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		state modelState
+		want  string
+	}{
+		{stateUnloaded, "unloaded"},
+		{stateLoading, "loading"},
+		{stateActive, "active"},
+		{stateSleep1, "sleep1"},
+		{stateSleep2, "sleep2"},
+		{modelState(99), "unknown"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.want, func(t *testing.T) {
+			t.Parallel()
+			got := tc.state.String()
+			if got != tc.want {
+				t.Errorf("modelState(%d).String() = %q, want %q", tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWaitForActive(t *testing.T) {
+	t.Parallel()
+
+	t.Run("loading transitions to active drains queue", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+
+		me.mu.Lock()
+		me.state = stateLoading
+		me.mu.Unlock()
+
+		rec := httptest.NewRecorder()
+		errFlag := false
+		rp := requestPair{
+			w:    rec,
+			r:    &http.Request{},
+			done: make(chan struct{}),
+			err:  &errFlag,
+		}
+		me.queue <- rp
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			o.waitForActive(me)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		me.mu.Lock()
+		me.state = stateActive
+		me.mu.Unlock()
+
+		wg.Wait()
+
+		select {
+		case <-rp.done:
+		default:
+			t.Fatal("done channel was not closed")
+		}
+		if errFlag {
+			t.Error("errFlag set, expected drainQueue (not 503)")
+		}
+		me.mu.Lock()
+		active := me.activeRequests
+		me.mu.Unlock()
+		if active != 1 {
+			t.Errorf("activeRequests = %d, want 1", active)
+		}
+	})
+
+	t.Run("loading transitions to unloaded drains with 503", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+
+		me.mu.Lock()
+		me.state = stateLoading
+		me.mu.Unlock()
+
+		rec := httptest.NewRecorder()
+		errFlag := false
+		rp := requestPair{
+			w:    rec,
+			r:    &http.Request{},
+			done: make(chan struct{}),
+			err:  &errFlag,
+		}
+		me.queue <- rp
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			o.waitForActive(me)
+		}()
+
+		time.Sleep(50 * time.Millisecond)
+		me.mu.Lock()
+		me.state = stateUnloaded
+		me.mu.Unlock()
+
+		wg.Wait()
+
+		select {
+		case <-rp.done:
+		default:
+			t.Fatal("done channel was not closed")
+		}
+		if !errFlag {
+			t.Error("errFlag not set, expected drainQueueWith503")
+		}
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("response status = %d, want 503", rec.Code)
+		}
+	})
+}
+
+// startMockVLLMServer starts a Unix socket HTTP server at sockPath with the
+// given handler. Returns a cleanup function.
+func startMockVLLMServer(t *testing.T, sockPath string, handler http.Handler) {
+	t.Helper()
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", sockPath, err)
+	}
+	srv := &http.Server{Handler: handler}
+	go srv.Serve(ln)
+	t.Cleanup(func() {
+		srv.Close()
+		ln.Close()
+	})
+}
+
+func TestTransitionToSleep(t *testing.T) {
+	t.Parallel()
+
+	t.Run("proc nil returns immediately", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+		me.mu.Lock()
+		me.state = stateActive
+		me.mem.weightsVRAMMB = 1024
+		me.mu.Unlock()
+
+		cpuBefore := o.ms.freeCPURAMB
+		o.transitionToSleep(me, nil, 1)
+
+		me.mu.Lock()
+		st := me.state
+		me.mu.Unlock()
+		if st != stateActive {
+			t.Errorf("state = %s, want active (unchanged)", st)
+		}
+		if o.ms.freeCPURAMB != cpuBefore {
+			t.Errorf("freeCPURAMB changed from %d to %d, want unchanged", cpuBefore, o.ms.freeCPURAMB)
+		}
+	})
+
+	t.Run("active to sleep1", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+
+		sockPath := t.TempDir() + "/test.sock"
+		mux := http.NewServeMux()
+		mux.HandleFunc("/sleep", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		mux.HandleFunc("/is_sleeping", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"is_sleeping":true}`)
+		})
+		startMockVLLMServer(t, sockPath, mux)
+
+		vp := makeTestVLLMProcess(sockPath)
+
+		me.mu.Lock()
+		me.state = stateActive
+		me.proc = vp
+		me.mem.weightsVRAMMB = 1024
+		me.mu.Unlock()
+
+		cpuBefore := o.ms.freeCPURAMB
+		o.transitionToSleep(me, vp, 1)
+
+		me.mu.Lock()
+		st := me.state
+		me.mu.Unlock()
+		if st != stateSleep1 {
+			t.Errorf("state = %s, want sleep1", st)
+		}
+		if o.ms.freeCPURAMB != cpuBefore-1024 {
+			t.Errorf("freeCPURAMB = %d, want %d (decremented by weightsVRAM)", o.ms.freeCPURAMB, cpuBefore-1024)
+		}
+	})
+
+	t.Run("active to sleep2", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+
+		sockPath := t.TempDir() + "/test.sock"
+		mux := http.NewServeMux()
+		mux.HandleFunc("/sleep", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		mux.HandleFunc("/is_sleeping", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"is_sleeping":true}`)
+		})
+		startMockVLLMServer(t, sockPath, mux)
+
+		vp := makeTestVLLMProcess(sockPath)
+
+		me.mu.Lock()
+		me.state = stateActive
+		me.proc = vp
+		me.mem.weightsVRAMMB = 1024
+		me.mu.Unlock()
+
+		cpuBefore := o.ms.freeCPURAMB
+		o.transitionToSleep(me, vp, 2)
+
+		me.mu.Lock()
+		st := me.state
+		me.mu.Unlock()
+		if st != stateSleep2 {
+			t.Errorf("state = %s, want sleep2", st)
+		}
+		if o.ms.freeCPURAMB != cpuBefore {
+			t.Errorf("freeCPURAMB = %d, want %d (unchanged)", o.ms.freeCPURAMB, cpuBefore)
+		}
+	})
+
+	t.Run("sleep1 to sleep2", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+
+		sockPath := t.TempDir() + "/test.sock"
+		mux := http.NewServeMux()
+		mux.HandleFunc("/sleep", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		mux.HandleFunc("/is_sleeping", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"is_sleeping":true}`)
+		})
+		startMockVLLMServer(t, sockPath, mux)
+
+		vp := makeTestVLLMProcess(sockPath)
+
+		me.mu.Lock()
+		me.state = stateSleep1
+		me.proc = vp
+		me.mem.weightsVRAMMB = 1024
+		me.mu.Unlock()
+
+		cpuBefore := o.ms.freeCPURAMB
+		o.transitionToSleep(me, vp, 2)
+
+		me.mu.Lock()
+		st := me.state
+		me.mu.Unlock()
+		if st != stateSleep2 {
+			t.Errorf("state = %s, want sleep2", st)
+		}
+		if o.ms.freeCPURAMB != cpuBefore+1024 {
+			t.Errorf("freeCPURAMB = %d, want %d (incremented by weightsVRAM)", o.ms.freeCPURAMB, cpuBefore+1024)
+		}
+	})
+}
+
+func TestWakeAndActivate(t *testing.T) {
+	t.Parallel()
+
+	t.Run("proc nil returns nil", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+		me.mu.Lock()
+		me.state = stateSleep1
+		me.mu.Unlock()
+
+		err := o.wakeAndActivate(me)
+		if err != nil {
+			t.Errorf("wakeAndActivate with nil proc returned error: %v", err)
+		}
+		me.mu.Lock()
+		st := me.state
+		me.mu.Unlock()
+		if st != stateSleep1 {
+			t.Errorf("state = %s, want sleep1 (unchanged)", st)
+		}
+	})
+
+	t.Run("sleep1 to active", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+
+		sockPath := t.TempDir() + "/test.sock"
+		mux := http.NewServeMux()
+		mux.HandleFunc("/wake_up", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		mux.HandleFunc("/is_sleeping", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"is_sleeping":false}`)
+		})
+		startMockVLLMServer(t, sockPath, mux)
+
+		vp := makeTestVLLMProcess(sockPath)
+
+		me.mu.Lock()
+		me.state = stateSleep1
+		me.proc = vp
+		me.mem.weightsVRAMMB = 1024
+		me.mu.Unlock()
+
+		cpuBefore := o.ms.freeCPURAMB
+		err := o.wakeAndActivate(me)
+		if err != nil {
+			t.Fatalf("wakeAndActivate: %v", err)
+		}
+
+		me.mu.Lock()
+		st := me.state
+		me.mu.Unlock()
+		if st != stateActive {
+			t.Errorf("state = %s, want active", st)
+		}
+		if o.ms.freeCPURAMB != cpuBefore+1024 {
+			t.Errorf("freeCPURAMB = %d, want %d (incremented by weightsVRAM)", o.ms.freeCPURAMB, cpuBefore+1024)
+		}
+	})
+
+	t.Run("sleep2 to active", func(t *testing.T) {
+		t.Parallel()
+		o := makeTestOrchestrator(t)
+		me := o.models[0]
+
+		sockPath := t.TempDir() + "/test.sock"
+		mux := http.NewServeMux()
+		mux.HandleFunc("/wake_up", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+		mux.HandleFunc("/is_sleeping", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"is_sleeping":false}`)
+		})
+		startMockVLLMServer(t, sockPath, mux)
+
+		vp := makeTestVLLMProcess(sockPath)
+
+		me.mu.Lock()
+		me.state = stateSleep2
+		me.proc = vp
+		me.mem.weightsVRAMMB = 1024
+		me.mu.Unlock()
+
+		cpuBefore := o.ms.freeCPURAMB
+		err := o.wakeAndActivate(me)
+		if err != nil {
+			t.Fatalf("wakeAndActivate: %v", err)
+		}
+
+		me.mu.Lock()
+		st := me.state
+		me.mu.Unlock()
+		if st != stateActive {
+			t.Errorf("state = %s, want active", st)
+		}
+		if o.ms.freeCPURAMB != cpuBefore {
+			t.Errorf("freeCPURAMB = %d, want %d (unchanged)", o.ms.freeCPURAMB, cpuBefore)
 		}
 	})
 }

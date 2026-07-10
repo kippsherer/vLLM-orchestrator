@@ -174,3 +174,113 @@ func TestInitMemory(t *testing.T) {
 type errTest string
 
 func (e errTest) Error() string { return string(e) }
+
+func TestRefreshMemory(t *testing.T) {
+	t.Parallel()
+
+	t.Run("happy_path", func(t *testing.T) {
+		origSmi := queryNvidiaSmiFreeMB
+		origMem := readMemAvailableMB
+		t.Cleanup(func() { queryNvidiaSmiFreeMB = origSmi; readMemAvailableMB = origMem })
+
+		queryNvidiaSmiFreeMB = func() (string, error) { return "0, 8192\n", nil }
+		readMemAvailableMB = func() (int64, error) { return 32768, nil }
+
+		ms := &memoryState{
+			groups: []*groupState{
+				{id: "g0", gpus: []int{0}, measuredFreeMB: -1},
+			},
+			freeCPURAMB: 0,
+		}
+		refreshMemory(ms)
+
+		if ms.groups[0].measuredFreeMB != 8192 {
+			t.Errorf("measuredFreeMB = %d, want 8192", ms.groups[0].measuredFreeMB)
+		}
+		if ms.freeCPURAMB != 32768 {
+			t.Errorf("freeCPURAMB = %d, want 32768", ms.freeCPURAMB)
+		}
+	})
+
+	t.Run("nvidia_smi_error", func(t *testing.T) {
+		origSmi := queryNvidiaSmiFreeMB
+		t.Cleanup(func() { queryNvidiaSmiFreeMB = origSmi })
+
+		queryNvidiaSmiFreeMB = func() (string, error) { return "", errTest("nvidia-smi failed") }
+
+		ms := &memoryState{
+			groups: []*groupState{
+				{id: "g0", gpus: []int{0}, measuredFreeMB: -1},
+			},
+		}
+		refreshMemory(ms)
+
+		if ms.groups[0].measuredFreeMB != -1 {
+			t.Errorf("measuredFreeMB = %d, want -1 (unchanged)", ms.groups[0].measuredFreeMB)
+		}
+	})
+
+	t.Run("parse_error", func(t *testing.T) {
+		origSmi := queryNvidiaSmiFreeMB
+		t.Cleanup(func() { queryNvidiaSmiFreeMB = origSmi })
+
+		queryNvidiaSmiFreeMB = func() (string, error) { return "malformed output\n", nil }
+
+		ms := &memoryState{
+			groups: []*groupState{
+				{id: "g0", gpus: []int{0}, measuredFreeMB: -1},
+			},
+		}
+		refreshMemory(ms)
+
+		if ms.groups[0].measuredFreeMB != -1 {
+			t.Errorf("measuredFreeMB = %d, want -1 (unchanged)", ms.groups[0].measuredFreeMB)
+		}
+	})
+
+	t.Run("cpu_meminfo_error", func(t *testing.T) {
+		origSmi := queryNvidiaSmiFreeMB
+		origMem := readMemAvailableMB
+		t.Cleanup(func() { queryNvidiaSmiFreeMB = origSmi; readMemAvailableMB = origMem })
+
+		queryNvidiaSmiFreeMB = func() (string, error) { return "0, 8192\n", nil }
+		readMemAvailableMB = func() (int64, error) { return 0, errTest("meminfo failed") }
+
+		ms := &memoryState{
+			groups: []*groupState{
+				{id: "g0", gpus: []int{0}, measuredFreeMB: -1},
+			},
+			freeCPURAMB: 0,
+		}
+		refreshMemory(ms)
+
+		if ms.groups[0].measuredFreeMB != 8192 {
+			t.Errorf("measuredFreeMB = %d, want 8192 (VRAM updated)", ms.groups[0].measuredFreeMB)
+		}
+		if ms.freeCPURAMB != 0 {
+			t.Errorf("freeCPURAMB = %d, want 0 (unchanged)", ms.freeCPURAMB)
+		}
+	})
+}
+
+func TestRefreshMemoryMultiGPUGroup(t *testing.T) {
+	t.Parallel()
+
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() { queryNvidiaSmiFreeMB = origSmi; readMemAvailableMB = origMem })
+
+	queryNvidiaSmiFreeMB = func() (string, error) { return "0, 4096\n1, 4096\n", nil }
+	readMemAvailableMB = func() (int64, error) { return 32768, nil }
+
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0, 1}, measuredFreeMB: -1},
+		},
+	}
+	refreshMemory(ms)
+
+	if ms.groups[0].measuredFreeMB != 8192 {
+		t.Errorf("measuredFreeMB = %d, want 8192", ms.groups[0].measuredFreeMB)
+	}
+}

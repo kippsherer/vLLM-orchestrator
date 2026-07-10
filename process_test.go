@@ -187,3 +187,45 @@ func makeTestVLLMProcess(sockPath string) *vllmProcess {
 		client:     &http.Client{Transport: transport},
 	}
 }
+
+func TestCheckSocketOwned(t *testing.T) {
+	t.Parallel()
+
+	t.Run("server_listening", func(t *testing.T) {
+		t.Parallel()
+		sockPath := t.TempDir() + "/test.sock"
+		ln, err := net.Listen("unix", sockPath)
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		t.Cleanup(func() { ln.Close() })
+
+		if err := checkSocketOwned(sockPath); err != nil {
+			t.Errorf("expected nil error, got %v", err)
+		}
+	})
+
+	t.Run("no_server", func(t *testing.T) {
+		t.Parallel()
+		sockPath := t.TempDir() + "/test.sock"
+		if err := checkSocketOwned(sockPath); err == nil {
+			t.Error("expected non-nil error, got nil")
+		}
+	})
+}
+
+func TestDrainAndMeasureNilMem(t *testing.T) {
+	t.Parallel()
+
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		drainAndMeasure(pr, "test-model", nil)
+		close(done)
+	}()
+	pw.Write([]byte("some regular log line\n"))
+	pw.Write([]byte("Generated 50 tokens/s\n"))
+	pw.Write([]byte("another line\n"))
+	pw.Close()
+	<-done
+}
