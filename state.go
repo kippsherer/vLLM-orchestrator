@@ -340,6 +340,7 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 			o.drainQueueWith503(me)
 			return
 		}
+		log.Printf("[orchestrator] %s: process started (pid %d), waiting for health", me.cfg.Name, proc.cmd.Process.Pid)
 
 		me.mu.Lock()
 		me.proc = proc
@@ -373,6 +374,7 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 			o.drainQueueWith503(me)
 			return
 		}
+		log.Printf("[orchestrator] %s: ready", me.cfg.Name)
 
 		me.mu.Lock()
 		if me.mem.measured {
