@@ -23,23 +23,25 @@ models:
       - "--tool-call-parser=hermes"
       - "--disable-custom-all-reduce"
 
-  - name: "Qwen/Qwen3-14B"
+  - name: "Qwen/Qwen3-14B-AWQ"
     aliases: ["qwen3-14b"]
     load_at_startup: false
-    vram_estimate_mb: 22000
+    vram_estimate_mb: 10000
     vllm_args:
-      - "--dtype=bfloat16"
+      - "--dtype=auto"
+      - "--quantization=awq"
       - "--max-model-len=32768"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
       - "--disable-custom-all-reduce"
 
-  - name: "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+  - name: "TechxGenus/DeepSeek-Coder-V2-Lite-Instruct-AWQ"
     aliases: ["deepseek-coder", "deepseek-coder-v2-lite"]
     load_at_startup: false
-    vram_estimate_mb: 22000
+    vram_estimate_mb: 10000
     vllm_args:
-      - "--dtype=bfloat16"
+      - "--dtype=auto"
+      - "--quantization=awq"
       - "--max-model-len=32768"
       - "--enable-prefix-caching"
       - "--trust-remote-code"
