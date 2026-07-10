@@ -28,13 +28,13 @@ UNLOADED ──request──► LOADING ──ready──► ACTIVE ──ttl_ac
 | State | GPU VRAM | CPU RAM | vLLM process |
 |---|---|---|---|
 | `UNLOADED` | 0 | 0 | not running |
-| `LOADING` | reserved | 0 | starting |
-| `ACTIVE` | full (weights + KV cache) | 0 | running |
-| `SLEEP1` | 0 | weights only | running, GPU freed |
-| `SLEEP2` | 0 | 0 | running, fully suspended |
+| `LOADING` | allocating | 0 | starting |
+| `ACTIVE` | weights + KV cache | 0 | running |
+| `SLEEP1` | KV cache only | weights | running |
+| `SLEEP2` | CUDA context only (~450 MB/GPU) | small model buffers | running, suspended |
 
-**SLEEP1** offloads weights to CPU RAM via `POST /sleep?level=1`. Resume is fast.  
-**SLEEP2** discards all GPU memory via `POST /sleep?level=2`. No CPU RAM held. Resume reloads from disk, slower than SLEEP1 but faster than a cold start.
+**SLEEP1** offloads weights to CPU RAM via `POST /sleep?level=1`. KV cache remains on GPU. Resume is fast — weights are mapped back from CPU without reloading from disk.  
+**SLEEP2** releases weights and KV cache from GPU via `POST /sleep?level=2`. Only the CUDA context (~450 MB per GPU) remains on GPU. A small set of model buffers (auxiliary tensors such as rotary embeddings) are retained in CPU RAM. Resume reloads weights from disk.
 
 ---
 
@@ -127,6 +127,8 @@ models:
   - name: "meta-llama/Meta-Llama-3-8B-Instruct"
     aliases: ["llama3-8b", "llama3"]   # optional; any alias routes to this model
     load_at_startup: true              # optional; load immediately on orchestrator start
+    vram_allocation: 75162             # MB this model is allowed to consume on the group;
+                                       # --gpu-memory-utilization is derived from this automatically
     vllm_args:                         # passed verbatim to `vllm serve`
       - "--dtype=float16"
       - "--max-model-len=8192"
@@ -135,6 +137,7 @@ models:
 
   - name: "mistralai/Mistral-7B-Instruct-v0.3"
     aliases: ["mistral-7b"]
+    vram_allocation: 75162
     vllm_args:
       - "--dtype=float16"
       - "--max-model-len=32768"
@@ -148,10 +151,10 @@ models:
 - Models are assigned to the **smallest group they fit into**, preserving larger groups for larger models.
 
 **Models**
-- `name` is the canonical HuggingFace model ID passed to `vllm serve`.
+- `vram_allocation` is the number of MB this model is allowed to consume across all GPUs in its group. The orchestrator derives `--gpu-memory-utilization` from this value automatically at launch time. Set it to `gpu_memory_utilization × total_group_vram_mb` for your hardware.
 - `aliases` are additional names clients may use in the `"model"` field. `/v1/models` always returns the canonical name.
 - `load_at_startup` is optional (default `false`). When `true`, the model begins loading when the orchestrator starts.
-- `vllm_args` are appended to `vllm serve <model_name>` verbatim. **Do not include** `--uds`, `--tensor-parallel-size`, or `CUDA_VISIBLE_DEVICES` — these are injected automatically.
+- `vllm_args` are appended to `vllm serve <model_name>` verbatim. **Do not include** `--uds`, `--tensor-parallel-size`, `--gpu-memory-utilization`, or `CUDA_VISIBLE_DEVICES` — these are injected automatically.
 
 **HuggingFace gated models**
 - Set `HF_TOKEN` in the orchestrator's environment. It is forwarded into each vLLM subprocess automatically. It is never written to config or logs.
@@ -179,22 +182,22 @@ All other routes (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `
 
 ### `/v1/models` response
 
-Each entry includes a non-standard `orchestrator_state` field (`"active"`, `"sleep1"`, `"sleep2"`, `"loading"`, `"unloaded"`) and an `estimated_vram_mb` field for models that are not currently active. For active models, the full vLLM response (including `max_model_len`, `per_model_config`, etc.) is returned unmodified with `orchestrator_state` appended.
+Each entry includes a non-standard `orchestrator_state` field (`"active"`, `"sleep1"`, `"sleep2"`, `"loading"`, `"unloaded"`) and an `allocated_vram_mb` field showing the model's configured VRAM allocation. For active models, the full vLLM response (including `max_model_len`, `per_model_config`, etc.) is returned unmodified with `orchestrator_state` appended.
 
 ---
 
 ## Memory accounting
 
-The orchestrator maintains software VRAM and CPU RAM accounting:
+The orchestrator maintains VRAM and CPU RAM accounting:
 
-- **VRAM** per GPU group: measured from `nvidia-smi` at startup; re-queried every 60 seconds.
-- **Model VRAM** (`weights + KV cache`): parsed from vLLM's stdout on first launch (`"Model loading took X.XX GiB"` and `"Available KV cache memory: X.XX GiB"`). Before the first launch, a placeholder of `group_total × 0.85` is used for scheduling.
-- **CPU RAM**: read from `/proc/meminfo` (`MemAvailable`) at startup; re-read every 60 seconds. Used to decide whether a sleeping model's weights can be offloaded to CPU (`SLEEP1`) or must be discarded (`SLEEP2`).
+- **VRAM** per GPU group: measured from `nvidia-smi` (`memory.free`) at startup and re-queried before every model launch and every 60 seconds.
+- **Model VRAM allocation**: set by `vram_allocation` in config. Used to derive `--gpu-memory-utilization` and to determine whether freeing rules must run before launching a new model.
+- **CPU RAM**: read from `/proc/meminfo` (`MemAvailable`) at startup and re-read every 60 seconds. Used to decide whether a sleeping model's weights can be offloaded to CPU (`SLEEP1`) or must be discarded (`SLEEP2`).
 
-When memory is needed to load a new model, the orchestrator runs freeing rules in order:
-1. Move idle ACTIVE models to SLEEP1 (smallest first; frees GPU VRAM)
-2. Terminate SLEEP2 processes (frees any remaining VRAM)
-3. Move SLEEP1 models to SLEEP2 (frees CPU RAM)
+When memory is needed to load a new model, the orchestrator first runs freeing rules proactively on any group that has other models assigned to it, then verifies free VRAM is sufficient. Freeing rules run in order:
+1. Move idle ACTIVE models to SLEEP1 (smallest first; offloads weights to CPU, frees that VRAM)
+2. Terminate SLEEP2 processes (frees all remaining GPU VRAM)
+3. Move SLEEP1 models to SLEEP2 (discards weights from CPU RAM)
 4. Terminate SLEEP2 processes again
 
 If memory is still insufficient after all four rules, all queued requests for the model receive 503.
