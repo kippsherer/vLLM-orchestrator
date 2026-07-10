@@ -30,7 +30,8 @@ models:
     vllm_args:
       - "--dtype=auto"
       - "--quantization=awq_marlin"
-      - "--max-model-len=32768"
+      - "--max-model-len=8192"
+      - "--gpu-memory-utilization=0.29"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
       - "--disable-custom-all-reduce"
