@@ -17,7 +17,7 @@ models:
     vram_estimate_mb: 28000
     vllm_args:
       - "--dtype=auto"
-      - "--quantization=awq"
+      - "--quantization=awq_marlin"
       - "--max-model-len=16384"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
@@ -29,7 +29,7 @@ models:
     vram_estimate_mb: 10000
     vllm_args:
       - "--dtype=auto"
-      - "--quantization=awq"
+      - "--quantization=awq_marlin"
       - "--max-model-len=32768"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
@@ -41,7 +41,7 @@ models:
     vram_estimate_mb: 10000
     vllm_args:
       - "--dtype=auto"
-      - "--quantization=awq"
+      - "--quantization=awq_marlin"
       - "--max-model-len=32768"
       - "--enable-prefix-caching"
       - "--trust-remote-code"
@@ -53,7 +53,7 @@ models:
     vram_estimate_mb: 28000
     vllm_args:
       - "--dtype=auto"
-      - "--quantization=awq"
+      - "--quantization=awq_marlin"
       - "--max-model-len=16384"
       - "--enable-prefix-caching"
       - "--tool-call-parser=hermes"
@@ -65,7 +65,7 @@ models:
     vram_estimate_mb: 12000
     vllm_args:
       - "--dtype=auto"
-      - "--quantization=awq"
+      - "--quantization=awq_marlin"
       - "--max-model-len=8192"
       - "--enable-prefix-caching"
       - "--disable-custom-all-reduce"
