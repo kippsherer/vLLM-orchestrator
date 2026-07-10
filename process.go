@@ -78,8 +78,8 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 
 	vp := &vllmProcess{cmd: cmd, socketPath: socketPath, client: client}
 
-	go drainAndMeasure(stdout, modelCfg.Name, mem, true)
-	go drainLog(stderr, modelCfg.Name)
+	go drainAndMeasure(stdout, modelCfg.Name, mem)
+	go drainAndMeasure(stderr, modelCfg.Name, nil)
 	// Reap the top-level process to avoid zombies. VRAM accounting is NOT
 	// driven by this — vLLM's worker children outlive the parent process.
 	go cmd.Wait()
@@ -106,10 +106,9 @@ func buildEnv(cudaVisible string) []string {
 	return out
 }
 
-// drainAndMeasure reads stdout, logs each line tagged with modelName, and
-// parses memory measurement lines into mem. measured is set true when both
-// values are found. Stdout is always drained to EOF regardless of measurement status.
-func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurement bool) {
+// drainAndMeasure reads r, logs each line tagged with modelName, and (when mem
+// is non-nil) parses memory measurement lines into mem. Drains to EOF always.
+func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory) {
 	warnDeadline := time.Now().Add(3600 * time.Second)
 	warnFired := false
 	sc := bufio.NewScanner(r)
@@ -118,9 +117,11 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurem
 		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") {
 			log.Printf("[vllm/%s] %s", modelName, line)
 		} else {
-			logVerbose("[vllm/%s] %s", modelName, line)
+			if verbose {
+				log.Printf("[vllm/%s] %s", modelName, line)
+			}
 		}
-		if !isMeasurement || mem.measured {
+		if mem == nil || mem.measured {
 			continue
 		}
 		if m := reWeights.FindStringSubmatch(line); m != nil {
@@ -142,28 +143,6 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory, isMeasurem
 			// Continue draining — do not break.
 		}
 	}
-	// drain remaining lines even after measurement complete or deadline
-	for sc.Scan() {
-		line := sc.Text()
-		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") {
-			log.Printf("[vllm/%s] %s", modelName, line)
-		} else {
-			logVerbose("[vllm/%s] %s", modelName, line)
-		}
-	}
-}
-
-// drainLog reads r and logs each line tagged with modelName.
-func drainLog(r io.Reader, modelName string) {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		line := sc.Text()
-		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") {
-			log.Printf("[vllm/%s] %s", modelName, line)
-		} else {
-			logVerbose("[vllm/%s] %s", modelName, line)
-		}
-	}
 }
 
 // waitForHealth polls GET /health on the vLLM process until 200 or 3600s timeout.
@@ -181,7 +160,7 @@ func waitForHealth(vp *vllmProcess, modelName string) error {
 		time.Sleep(2 * time.Second)
 	}
 	killProcess(vp, modelName)
-	return fmt.Errorf("vllm %q: health poll timed out after 300s", modelName)
+	return fmt.Errorf("vllm %q: health poll timed out after 3600s", modelName)
 }
 
 // killProcess sends SIGTERM and waits 30s before SIGKILL, then removes the socket.
@@ -275,13 +254,4 @@ func pollIsSleeping(vp *vllmProcess) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("unexpected /is_sleeping body: %s", s)
-}
-
-// runCommand executes a command and returns combined stdout, or an error.
-func runCommand(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
 }

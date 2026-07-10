@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"sync"
@@ -487,6 +488,32 @@ func (o *orchestrator) waitForActive(me *modelEntry) {
 		}
 	}
 }
+
+// loadModel triggers an internal load of me without an inbound HTTP request.
+// Used for load_at_startup. Blocks until the model reaches ACTIVE or fails.
+func (o *orchestrator) loadModel(me *modelEntry) {
+	errFlag := false
+	rp := requestPair{
+		w:    discardResponseWriter{},
+		r:    &http.Request{},
+		done: make(chan struct{}),
+		err:  &errFlag,
+	}
+	// Provide a non-nil context so routeRequest's r.Context().Done() doesn't panic.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rp.r = rp.r.WithContext(ctx)
+	o.handleRequest(me, rp)
+	<-rp.done
+}
+
+// discardResponseWriter is a minimal http.ResponseWriter for internal boot
+// requests where no real client is waiting.
+type discardResponseWriter struct{}
+
+func (discardResponseWriter) Header() http.Header         { return http.Header{} }
+func (discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (discardResponseWriter) WriteHeader(int)             {}
 
 // completeRequest decrements activeRequests and resets the TTL clock.
 func (o *orchestrator) completeRequest(me *modelEntry) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -47,13 +48,14 @@ func (o *orchestrator) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Routes needing ?model= routing (no body peek).
-	if path == "/metrics" || path == "/docs" || path == "/redoc" || path == "/openapi.json" {
-		if path == "/docs" || path == "/redoc" || path == "/openapi.json" {
-			o.forwardToAnyActive(w, r)
-			return
-		}
-		// /metrics: require ?model= param.
+	// Routes for docs/spec endpoints: forward to any active instance.
+	if path == "/docs" || path == "/redoc" || path == "/openapi.json" {
+		o.forwardToAnyActive(w, r)
+		return
+	}
+
+	// /metrics: require ?model= param.
+	if path == "/metrics" {
 		modelParam := r.URL.Query().Get("model")
 		if modelParam == "" {
 			http.Error(w, "bad request: ?model= required for /metrics", http.StatusBadRequest)
@@ -92,24 +94,35 @@ func (o *orchestrator) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// POST/PUT/PATCH: peek body for "model" field.
-	modelName, buf, err := peekModel(r)
-	if err != nil || modelName == "" {
-		http.Error(w, "bad request: could not extract model field", http.StatusBadRequest)
+	me, buf, ok := o.peekAndResolve(w, r)
+	if !ok {
 		return
-	}
-	me := o.resolve(modelName)
-	if me == nil {
-		http.Error(w, "model not found", http.StatusNotFound)
-		return
-	}
-	// Rewrite alias to canonical name so vLLM recognises it.
-	if modelName != me.cfg.Name {
-		buf = rewriteModelField(buf, me.cfg.Name)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	r.ContentLength = int64(len(buf))
 
 	o.routeRequest(w, r, me)
+}
+
+// peekAndResolve reads the request body, extracts the "model" field, resolves
+// it to a modelEntry, and rewrites the body if the name is an alias. Returns
+// the entry and the (possibly rewritten) body. Writes an HTTP error and returns
+// ok=false on any failure.
+func (o *orchestrator) peekAndResolve(w http.ResponseWriter, r *http.Request) (*modelEntry, []byte, bool) {
+	modelName, buf, err := peekModel(r)
+	if err != nil || modelName == "" {
+		http.Error(w, "bad request: could not extract model field", http.StatusBadRequest)
+		return nil, nil, false
+	}
+	me := o.resolve(modelName)
+	if me == nil {
+		http.Error(w, "model not found", http.StatusNotFound)
+		return nil, nil, false
+	}
+	if modelName != me.cfg.Name {
+		buf = rewriteModelField(buf, me.cfg.Name)
+	}
+	return me, buf, true
 }
 
 // routeRequest drives the state machine / queuing and then proxies the request.
@@ -149,7 +162,9 @@ func (o *orchestrator) forwardDirect(w http.ResponseWriter, r *http.Request, me 
 		Transport:     transport,
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			logVerbose("[proxy] %s upstream error: %v", me.cfg.Name, err)
+			if verbose {
+				log.Printf("[proxy] %s upstream error: %v", me.cfg.Name, err)
+			}
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		},
 	}
@@ -368,7 +383,9 @@ func (o *orchestrator) serveModels(w http.ResponseWriter, r *http.Request) {
 func fetchLiveModels(proc *vllmProcess, modelName string) []json.RawMessage {
 	resp, err := proc.client.Get("http://vllm/v1/models")
 	if err != nil {
-		logVerbose("[proxy] fetchLiveModels %s: %v", modelName, err)
+		if verbose {
+			log.Printf("[proxy] fetchLiveModels %s: %v", modelName, err)
+		}
 		return nil
 	}
 	defer resp.Body.Close()
@@ -376,7 +393,9 @@ func fetchLiveModels(proc *vllmProcess, modelName string) []json.RawMessage {
 		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		logVerbose("[proxy] fetchLiveModels %s decode: %v", modelName, err)
+		if verbose {
+			log.Printf("[proxy] fetchLiveModels %s decode: %v", modelName, err)
+		}
 		return nil
 	}
 	return out.Data
@@ -392,18 +411,9 @@ func injectState(raw json.RawMessage, state string) json.RawMessage {
 
 // serveWebSocket tunnels a WebSocket upgrade request to the vLLM Unix socket.
 func (o *orchestrator) serveWebSocket(w http.ResponseWriter, r *http.Request) {
-	modelName, buf, err := peekModel(r)
-	if err != nil || modelName == "" {
-		http.Error(w, "bad request: could not extract model field", http.StatusBadRequest)
+	me, buf, ok := o.peekAndResolve(w, r)
+	if !ok {
 		return
-	}
-	me := o.resolve(modelName)
-	if me == nil {
-		http.Error(w, "model not found", http.StatusNotFound)
-		return
-	}
-	if modelName != me.cfg.Name {
-		buf = rewriteModelField(buf, me.cfg.Name)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	r.ContentLength = int64(len(buf))

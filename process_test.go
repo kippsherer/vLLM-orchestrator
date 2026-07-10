@@ -60,7 +60,7 @@ func TestDrainAndMeasure(t *testing.T) {
 		mem := &modelMemory{}
 		done := make(chan struct{})
 		go func() {
-			drainAndMeasure(pr, "test-model", mem, true)
+			drainAndMeasure(pr, "test-model", mem)
 			close(done)
 		}()
 		pw.Write([]byte("INFO [model_runner.py:295] Model loading took 7.00 GiB and 7.8 seconds\n"))
@@ -85,7 +85,7 @@ func TestDrainAndMeasure(t *testing.T) {
 		mem := &modelMemory{}
 		done := make(chan struct{})
 		go func() {
-			drainAndMeasure(pr, "test-model", mem, true)
+			drainAndMeasure(pr, "test-model", mem)
 			close(done)
 		}()
 		// Write irrelevant lines only, then close.

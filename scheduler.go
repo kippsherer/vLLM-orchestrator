@@ -40,25 +40,20 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 		// as soon as one group has enough free VRAM.
 		idx = -1
 		o.ms.mu.RLock()
-		var candidates []*groupState
-		for _, gs := range o.ms.groups {
+		type candidateGroup struct {
+			idx int
+			gs  *groupState
+		}
+		var candidates []candidateGroup
+		for i, gs := range o.ms.groups {
 			if gs.measuredTotalVRAMMB >= needed {
-				candidates = append(candidates, gs)
+				candidates = append(candidates, candidateGroup{i, gs})
 			}
 		}
 		o.ms.mu.RUnlock()
-		for i, gs := range candidates {
-			if o.freeMemoryRules(gs, needed) {
-				// Find the index of this group in ms.groups.
-				o.ms.mu.RLock()
-				for j, g := range o.ms.groups {
-					if g == gs {
-						idx = j
-						break
-					}
-				}
-				o.ms.mu.RUnlock()
-				_ = i
+		for _, c := range candidates {
+			if o.freeMemoryRules(c.gs, needed) {
+				idx = c.idx
 				break
 			}
 		}
@@ -107,7 +102,7 @@ func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
 // Rule 4: repeat Rule 2
 func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 	// Rule 1: ACTIVE → SLEEP1
-	for _, me := range o.idleActiveModels() {
+	for _, me := range o.idleModels(stateActive, func(a, b *modelEntry) bool { return a.mem.fullKVVRAMMB < b.mem.fullKVVRAMMB }) {
 		me.mu.Lock()
 		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
 			me.mu.Unlock()
@@ -157,7 +152,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 	}
 
 	// Rule 2: SLEEP2 → UNLOADED
-	for _, me := range o.idleSleep2Models() {
+	for _, me := range o.idleModels(stateSleep2, func(a, b *modelEntry) bool { return a.mem.fullKVVRAMMB < b.mem.fullKVVRAMMB }) {
 		me.mu.Lock()
 		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
 			me.mu.Unlock()
@@ -187,7 +182,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 	}
 
 	// Rule 3: SLEEP1 → SLEEP2
-	for _, me := range o.idleSleep1Models() {
+	for _, me := range o.idleModels(stateSleep1, func(a, b *modelEntry) bool { return a.mem.weightsVRAMMB < b.mem.weightsVRAMMB }) {
 		me.mu.Lock()
 		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
 			me.mu.Unlock()
@@ -219,7 +214,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 	}
 
 	// Rule 4: repeat Rule 2
-	for _, me := range o.idleSleep2Models() {
+	for _, me := range o.idleModels(stateSleep2, func(a, b *modelEntry) bool { return a.mem.fullKVVRAMMB < b.mem.fullKVVRAMMB }) {
 		me.mu.Lock()
 		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
 			me.mu.Unlock()
@@ -254,7 +249,7 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 // freeCPURam demotes idle SLEEP1 models to SLEEP2 (smallest weightsVRAMMB first)
 // until real free CPU RAM >= neededCPUMB. Called inline from rule 1.
 func (o *orchestrator) freeCPURam(neededCPUMB int64) {
-	for _, me := range o.idleSleep1Models() {
+	for _, me := range o.idleModels(stateSleep1, func(a, b *modelEntry) bool { return a.mem.weightsVRAMMB < b.mem.weightsVRAMMB }) {
 		refreshMemory(o.ms)
 		o.ms.mu.RLock()
 		cpuFree := o.ms.freeCPURAMB
@@ -304,70 +299,29 @@ func waitVRAMStable(ms *memoryState, gs *groupState, freeBefore, expectedMB int6
 		ms.mu.RLock()
 		cur := gs.measuredFreeMB
 		ms.mu.RUnlock()
-		if cur >= threshold75 && abs64(cur-prev) <= jitter {
+		diff := cur - prev
+		if diff < 0 {
+			diff = -diff
+		}
+		if cur >= threshold75 && diff <= jitter {
 			return
 		}
 		prev = cur
 	}
 }
 
-func abs64(x int64) int64 {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
-// idleActiveModels returns idle ACTIVE models sorted smallest fullKVVRAMMB first.
-func (o *orchestrator) idleActiveModels() []*modelEntry {
+// idleModels returns idle models in the given state, sorted by less.
+func (o *orchestrator) idleModels(state modelState, less func(a, b *modelEntry) bool) []*modelEntry {
 	var out []*modelEntry
 	for _, me := range o.models {
 		me.mu.Lock()
 		s := me.state
 		active := me.activeRequests
 		me.mu.Unlock()
-		if s == stateActive && active == 0 {
+		if s == state && active == 0 {
 			out = append(out, me)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].mem.fullKVVRAMMB < out[j].mem.fullKVVRAMMB
-	})
-	return out
-}
-
-// idleSleep2Models returns idle SLEEP2 models sorted smallest fullKVVRAMMB first.
-func (o *orchestrator) idleSleep2Models() []*modelEntry {
-	var out []*modelEntry
-	for _, me := range o.models {
-		me.mu.Lock()
-		s := me.state
-		active := me.activeRequests
-		me.mu.Unlock()
-		if s == stateSleep2 && active == 0 {
-			out = append(out, me)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].mem.fullKVVRAMMB < out[j].mem.fullKVVRAMMB
-	})
-	return out
-}
-
-// idleSleep1Models returns idle SLEEP1 models sorted smallest weightsVRAMMB first.
-func (o *orchestrator) idleSleep1Models() []*modelEntry {
-	var out []*modelEntry
-	for _, me := range o.models {
-		me.mu.Lock()
-		s := me.state
-		active := me.activeRequests
-		me.mu.Unlock()
-		if s == stateSleep1 && active == 0 {
-			out = append(out, me)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].mem.weightsVRAMMB < out[j].mem.weightsVRAMMB
-	})
+	sort.Slice(out, func(i, j int) bool { return less(out[i], out[j]) })
 	return out
 }

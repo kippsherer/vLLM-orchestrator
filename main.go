@@ -15,12 +15,6 @@ import (
 
 var verbose bool
 
-func logVerbose(format string, args ...any) {
-	if verbose {
-		log.Printf(format, args...)
-	}
-}
-
 func main() {
 	configPath := flag.String("config", "", "path to YAML config file")
 	flag.BoolVar(&verbose, "verbose", false, "enable verbose logging")
@@ -51,7 +45,19 @@ func main() {
 	refreshMemory(ms)
 
 	// Remove stale socket files from a prior crash.
-	cleanStaleSocketFiles(cfg)
+	entries, err := os.ReadDir(cfg.VLLMSocketDir)
+	if err == nil {
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".sock") {
+				continue
+			}
+			path := filepath.Join(cfg.VLLMSocketDir, e.Name())
+			if checkSocketOwned(path) != nil {
+				os.Remove(path)
+				log.Printf("startup: removed stale socket %s", path)
+			}
+		}
+	}
 
 	o := newOrchestrator(cfg, ms)
 	o.startTTLLoops()
@@ -61,10 +67,7 @@ func main() {
 	for _, me := range o.models {
 		if me.cfg.LoadAtStartup {
 			go func(m *modelEntry) {
-				errFlag := false
-				rp := requestPair{w: noopResponseWriter{}, r: &http.Request{}, done: make(chan struct{}), err: &errFlag}
-				o.handleRequest(m, rp)
-				<-rp.done
+				o.loadModel(m)
 			}(me)
 		}
 	}
@@ -106,30 +109,3 @@ func main() {
 	}
 	log.Println("shutdown complete")
 }
-
-// cleanStaleSocketFiles removes *.sock files in vllm_socket_dir that are not
-// owned by a live process.
-func cleanStaleSocketFiles(cfg *Config) {
-	entries, err := os.ReadDir(cfg.VLLMSocketDir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".sock") {
-			continue
-		}
-		path := filepath.Join(cfg.VLLMSocketDir, e.Name())
-		if checkSocketOwned(path) != nil {
-			os.Remove(path)
-			log.Printf("startup: removed stale socket %s", path)
-		}
-	}
-}
-
-// noopResponseWriter is a minimal http.ResponseWriter used for load_at_startup
-// internal boot requests where no real client is waiting.
-type noopResponseWriter struct{}
-
-func (noopResponseWriter) Header() http.Header         { return http.Header{} }
-func (noopResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
-func (noopResponseWriter) WriteHeader(int)             {}

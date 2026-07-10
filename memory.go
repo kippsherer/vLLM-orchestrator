@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,25 +37,25 @@ type modelMemory struct {
 // queryNvidiaSmi is the function used to obtain nvidia-smi total-memory output.
 // Replaced in tests via assignment.
 var queryNvidiaSmi = func() (string, error) {
-	out, err := runCommand("nvidia-smi",
+	out, err := exec.Command("nvidia-smi",
 		"--query-gpu=index,memory.total",
-		"--format=csv,noheader,nounits")
+		"--format=csv,noheader,nounits").Output()
 	if err != nil {
 		return "", fmt.Errorf("nvidia-smi: %w", err)
 	}
-	return out, nil
+	return string(out), nil
 }
 
 // queryNvidiaSmiFreeMB is the function used to obtain nvidia-smi free-memory output.
 // Replaced in tests via assignment.
 var queryNvidiaSmiFreeMB = func() (string, error) {
-	out, err := runCommand("nvidia-smi",
+	out, err := exec.Command("nvidia-smi",
 		"--query-gpu=index,memory.free",
-		"--format=csv,noheader,nounits")
+		"--format=csv,noheader,nounits").Output()
 	if err != nil {
 		return "", fmt.Errorf("nvidia-smi free: %w", err)
 	}
-	return out, nil
+	return string(out), nil
 }
 
 // initMemory queries nvidia-smi and /proc/meminfo, validates that every
