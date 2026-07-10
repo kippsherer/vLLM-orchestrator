@@ -374,15 +374,11 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 			return
 		}
 
-		// Refine VRAM reservation from placeholder to actual if now measured.
 		me.mu.Lock()
 		if me.mem.measured {
 			me.reservedVRAMMB = me.mem.fullKVVRAMMB
 		}
-		me.mu.Unlock()
-
-		me.mu.Lock()
-		me.reservedVRAMMB = 0
+		// If not yet measured, reservedVRAMMB retains the placeholder set by assignGroup.
 		me.state = stateActive
 		me.lastCompleted = time.Now()
 		me.mu.Unlock()

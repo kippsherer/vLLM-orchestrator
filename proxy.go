@@ -306,7 +306,7 @@ func (o *orchestrator) serveModels(w http.ResponseWriter, r *http.Request) {
 		Created           int64  `json:"created"`
 		OwnedBy           string `json:"owned_by"`
 		OrchestratorState string `json:"orchestrator_state"`
-		EstimatedVRAMMB   int64  `json:"estimated_vram_mb,omitempty"`
+		AllocatedVRAMMB   int64 `json:"allocated_vram_mb,omitempty"`
 	}
 	type modelsResp struct {
 		Object string        `json:"object"`
@@ -319,8 +319,6 @@ func (o *orchestrator) serveModels(w http.ResponseWriter, r *http.Request) {
 	for _, me := range o.models {
 		me.mu.Lock()
 		state := me.state
-		mem := me.mem
-		groupIdx := me.assignedGroupIdx
 		proc := me.proc
 		me.mu.Unlock()
 
@@ -341,36 +339,13 @@ func (o *orchestrator) serveModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Synthesize stub.
-		var estimatedVRAM int64
-		if mem.measured {
-			estimatedVRAM = mem.fullKVVRAMMB
-		} else if groupIdx >= 0 {
-			o.ms.mu.RLock()
-			estimatedVRAM = int64(float64(o.ms.groups[groupIdx].measuredTotalVRAMMB) * 0.85)
-			o.ms.mu.RUnlock()
-		} else {
-			// UNLOADED and never launched: use smallest group as reference.
-			o.ms.mu.RLock()
-			if len(o.ms.groups) > 0 {
-				smallest := o.ms.groups[0]
-				for _, gs := range o.ms.groups[1:] {
-					if gs.measuredTotalVRAMMB < smallest.measuredTotalVRAMMB {
-						smallest = gs
-					}
-				}
-				estimatedVRAM = int64(float64(smallest.measuredTotalVRAMMB) * 0.85)
-			}
-			o.ms.mu.RUnlock()
-		}
-
 		data = append(data, modelEntry_{
 			ID:                me.cfg.Name,
 			Object:            "model",
 			Created:           created,
 			OwnedBy:           "vllm-orchestrator",
 			OrchestratorState: stateStr,
-			EstimatedVRAMMB:   estimatedVRAM,
+			AllocatedVRAMMB:   me.cfg.VRAMAllocationMB,
 		})
 	}
 

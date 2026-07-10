@@ -14,8 +14,8 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	var needed int64
 	if me.mem.measured {
 		needed = me.mem.fullKVVRAMMB
-	} else if me.cfg.VRAMEstimateMB > 0 {
-		needed = me.cfg.VRAMEstimateMB
+	} else if me.cfg.VRAMAllocationMB > 0 {
+		needed = me.cfg.VRAMAllocationMB
 	} else {
 		o.ms.mu.RLock()
 		smallest := o.ms.groups[0].measuredTotalVRAMMB
@@ -28,6 +28,22 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 		needed = int64(float64(smallest) * 0.85)
 	}
 
+	// Run freeing rules on any group that has other models assigned to it,
+	// regardless of what nvidia-smi currently reports as free. A model in
+	// SLEEP1 has its weights offloaded but its KV cache still allocated on
+	// the GPU — nvidia-smi correctly shows that KV memory as used, but the
+	// margin may be thin enough that pickGroup passes while the actual
+	// per-device headroom is insufficient for the incoming model to start.
+	// Evicting first guarantees a clean GPU before launch.
+	for i, gs := range o.ms.groups {
+		if gs.measuredTotalVRAMMB < needed {
+			continue
+		}
+		if o.groupHasOtherModels(i, me) {
+			o.freeMemoryRules(gs, needed)
+		}
+	}
+
 	refreshMemory(o.ms)
 
 	o.ms.mu.Lock()
@@ -35,10 +51,15 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	o.ms.mu.Unlock()
 
 	if err != nil {
-		// No group has enough free VRAM right now. Run freeing rules on each
-		// group whose total VRAM is large enough to hold the model, stopping
-		// as soon as one group has enough free VRAM.
 		idx = -1
+
+		// Log every model's current state so failures are diagnosable.
+		for _, me := range o.models {
+			me.mu.Lock()
+			log.Printf("[scheduler] model %s: state=%s activeRequests=%d reservedVRAM=%dMB assignedGroup=%d",
+				me.cfg.Name, me.state, me.activeRequests, me.reservedVRAMMB, me.assignedGroupIdx)
+			me.mu.Unlock()
+		}
 		o.ms.mu.RLock()
 		type candidateGroup struct {
 			idx int
@@ -72,6 +93,23 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	return idx, nil
 }
 
+// groupHasOtherModels reports whether any model other than exclude is
+// assigned to group index groupIdx.
+func (o *orchestrator) groupHasOtherModels(groupIdx int, exclude *modelEntry) bool {
+	for _, m := range o.models {
+		if m == exclude {
+			continue
+		}
+		m.mu.Lock()
+		assigned := m.assignedGroupIdx
+		m.mu.Unlock()
+		if assigned == groupIdx {
+			return true
+		}
+	}
+	return false
+}
+
 // pickGroup finds the qualifying group with the smallest measuredTotalVRAMMB.
 // Must be called with ms.mu held.
 func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
@@ -102,7 +140,11 @@ func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
 // Rule 4: repeat Rule 2
 func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 	// Rule 1: ACTIVE → SLEEP1
-	for _, me := range o.idleModels(stateActive, func(a, b *modelEntry) bool { return a.mem.fullKVVRAMMB < b.mem.fullKVVRAMMB }) {
+	// Does not require activeRequests==0: sleep level 1 only offloads KV cache
+	// to CPU RAM; vLLM itself defers the offload until in-flight requests drain.
+	candidates := o.activeModels(func(a, b *modelEntry) bool { return a.mem.fullKVVRAMMB < b.mem.fullKVVRAMMB })
+	log.Printf("[scheduler] rule1: %d ACTIVE model(s) on group %s", len(candidates), gs.id)
+	for _, me := range candidates {
 		me.mu.Lock()
 		if me.assignedGroupIdx < 0 || o.ms.groups[me.assignedGroupIdx] != gs {
 			me.mu.Unlock()
@@ -319,6 +361,23 @@ func (o *orchestrator) idleModels(state modelState, less func(a, b *modelEntry) 
 		active := me.activeRequests
 		me.mu.Unlock()
 		if s == state && active == 0 {
+			out = append(out, me)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return less(out[i], out[j]) })
+	return out
+}
+
+// activeModels returns all models in stateActive regardless of activeRequests,
+// sorted by less. Used by Rule 1 (ACTIVE → SLEEP1) where sleep is safe while
+// requests are in-flight because vLLM defers the KV offload until they drain.
+func (o *orchestrator) activeModels(less func(a, b *modelEntry) bool) []*modelEntry {
+	var out []*modelEntry
+	for _, me := range o.models {
+		me.mu.Lock()
+		s := me.state
+		me.mu.Unlock()
+		if s == stateActive {
 			out = append(out, me)
 		}
 	}

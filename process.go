@@ -52,6 +52,7 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 	args := append([]string{"serve", modelCfg.Name,
 		"--uds", socketPath,
 		"--tensor-parallel-size", tpSize,
+		"--gpu-memory-utilization", fmt.Sprintf("%.2f", float64(modelCfg.VRAMAllocationMB)/float64(group.measuredTotalVRAMMB)),
 	}, modelCfg.VLLMArgs...)
 
 	cmd := exec.Command("vllm", args...)
@@ -88,21 +89,24 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 }
 
 // buildEnv constructs the subprocess environment from the current env,
-// injecting CUDA_VISIBLE_DEVICES and VLLM_SERVER_DEV_MODE=1.
+// injecting CUDA_VISIBLE_DEVICES, VLLM_SERVER_DEV_MODE=1, and OMP_NUM_THREADS=1.
+// OMP_NUM_THREADS is pinned to 1 to suppress vLLM's "Reducing Torch parallelism"
+// warning; vLLM's EngineCore runs single-threaded CPU work and gains nothing from
+// extra OpenMP threads.
 func buildEnv(cudaVisible string) []string {
 	base := os.Environ()
-	out := make([]string, 0, len(base)+2)
+	out := make([]string, 0, len(base)+3)
 	for _, kv := range base {
 		k := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			k = kv[:i]
 		}
-		if k == "CUDA_VISIBLE_DEVICES" || k == "VLLM_SERVER_DEV_MODE" {
+		if k == "CUDA_VISIBLE_DEVICES" || k == "VLLM_SERVER_DEV_MODE" || k == "OMP_NUM_THREADS" {
 			continue
 		}
 		out = append(out, kv)
 	}
-	out = append(out, "CUDA_VISIBLE_DEVICES="+cudaVisible, "VLLM_SERVER_DEV_MODE=1")
+	out = append(out, "CUDA_VISIBLE_DEVICES="+cudaVisible, "VLLM_SERVER_DEV_MODE=1", "OMP_NUM_THREADS=1")
 	return out
 }
 

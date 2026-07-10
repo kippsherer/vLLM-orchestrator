@@ -18,6 +18,7 @@ models:
   - name: "meta-llama/Meta-Llama-3-8B-Instruct"
     aliases: ["llama3-8b", "llama3"]
     load_at_startup: false
+    vram_allocation: 75162    # 0.92 * 24576 * 4 GPUs — adjust to your group total and desired utilization
     vllm_args:
       - "--dtype=float16"
       - "--max-model-len=8192"
@@ -27,6 +28,7 @@ models:
   - name: "mistralai/Mistral-7B-Instruct-v0.3"
     aliases: ["mistral-7b", "mistral"]
     load_at_startup: false
+    vram_allocation: 75162
     vllm_args:
       - "--dtype=float16"
       - "--max-model-len=32768"
@@ -35,6 +37,7 @@ models:
   - name: "casperhansen/llama-3-70b-instruct-awq"
     aliases: ["llama3-70b-awq"]
     load_at_startup: false
+    vram_allocation: 75162
     vllm_args:
       - "--dtype=auto"
       - "--quantization=awq"
@@ -44,6 +47,7 @@ models:
   - name: "llava-hf/llava-1.5-7b-hf"
     aliases: ["llava"]
     load_at_startup: false
+    vram_allocation: 75162
     vllm_args:
       - "--dtype=float16"
       - "--max-model-len=4096"

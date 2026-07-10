@@ -423,55 +423,17 @@ func TestPeekAndResolve(t *testing.T) {
 func TestServeModelsVRAMBranches(t *testing.T) {
 	t.Parallel()
 
-	t.Run("measured_true", func(t *testing.T) {
+	t.Run("allocated_vram_mb_from_config", func(t *testing.T) {
 		t.Parallel()
 		o := makeTestOrchestrator(t)
-		o.models[0].mu.Lock()
-		o.models[0].mem.measured = true
-		o.models[0].mem.fullKVVRAMMB = 12345
-		o.models[0].assignedGroupIdx = 0
-		o.models[0].mu.Unlock()
+		o.models[0].cfg.VRAMAllocationMB = 19661
 
 		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 		rec := httptest.NewRecorder()
 		o.serveModels(rec, req)
 		body := rec.Body.String()
-		if !strings.Contains(body, `"estimated_vram_mb":12345`) {
-			t.Errorf("body %q missing estimated_vram_mb:12345 for measured model", body)
-		}
-	})
-
-	t.Run("measured_false_valid_group", func(t *testing.T) {
-		t.Parallel()
-		o := makeTestOrchestrator(t)
-		o.models[0].mu.Lock()
-		o.models[0].mem.measured = false
-		o.models[0].assignedGroupIdx = 0
-		o.models[0].mu.Unlock()
-
-		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-		rec := httptest.NewRecorder()
-		o.serveModels(rec, req)
-		body := rec.Body.String()
-		if !strings.Contains(body, `"estimated_vram_mb":20889`) {
-			t.Errorf("body %q missing estimated_vram_mb:20889 for valid group", body)
-		}
-	})
-
-	t.Run("measured_false_never_launched", func(t *testing.T) {
-		t.Parallel()
-		o := makeTestOrchestrator(t)
-		o.models[0].mu.Lock()
-		o.models[0].mem.measured = false
-		o.models[0].assignedGroupIdx = -1
-		o.models[0].mu.Unlock()
-
-		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-		rec := httptest.NewRecorder()
-		o.serveModels(rec, req)
-		body := rec.Body.String()
-		if !strings.Contains(body, `"estimated_vram_mb":20889`) {
-			t.Errorf("body %q missing estimated_vram_mb:20889 for never launched", body)
+		if !strings.Contains(body, `"allocated_vram_mb":19661`) {
+			t.Errorf("body %q missing allocated_vram_mb:19661", body)
 		}
 	})
 }

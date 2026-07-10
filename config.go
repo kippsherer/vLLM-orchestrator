@@ -32,7 +32,7 @@ type ModelConfig struct {
 	Name           string   `yaml:"name"`
 	Aliases        []string `yaml:"aliases"`
 	LoadAtStartup  bool     `yaml:"load_at_startup"`
-	VRAMEstimateMB int64    `yaml:"vram_estimate_mb"` // pre-load VRAM placeholder; 0 = use group-total * 0.85
+	VRAMAllocationMB int64  `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
 	VLLMArgs       []string `yaml:"vllm_args"`
 }
 

@@ -16,8 +16,8 @@ import (
 type groupState struct {
 	id                  string
 	gpus                []int
-	measuredTotalVRAMMB int64 // from nvidia-smi at startup
-	measuredFreeMB      int64 // actual free VRAM from nvidia-smi; -1 until first refreshMemory call
+	measuredTotalVRAMMB int64 // sum of total VRAM across all GPUs in group
+	measuredFreeMB      int64 // total - used across all GPUs; -1 until first refreshMemory call
 }
 
 // memoryState holds all VRAM and CPU RAM accounting.
@@ -135,7 +135,6 @@ func parseNvidiaSmi(output string) (map[int]int64, error) {
 	return m, nil
 }
 
-// readMemAvailableMB reads MemAvailable from /proc/meminfo and returns MB.
 var readMemAvailableMB = func() (int64, error) {
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
@@ -191,13 +190,13 @@ func refreshMemory(ms *memoryState) {
 	defer ms.mu.Unlock()
 
 	for _, gs := range ms.groups {
-		var measuredFreeMB int64
+		var freeMB int64
 		for _, dev := range gs.gpus {
 			if mb, ok := freeByDev[dev]; ok {
-				measuredFreeMB += mb
+				freeMB += mb
 			}
 		}
-		gs.measuredFreeMB = measuredFreeMB
+		gs.measuredFreeMB = freeMB
 	}
 
 	cpuMB, err := readMemAvailableMB()
