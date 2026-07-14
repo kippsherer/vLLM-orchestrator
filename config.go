@@ -29,11 +29,12 @@ type GPUGroup struct {
 
 // ModelConfig is the per-model entry from the YAML file.
 type ModelConfig struct {
-	Name           string   `yaml:"name"`
-	Aliases        []string `yaml:"aliases"`
-	LoadAtStartup  bool     `yaml:"load_at_startup"`
-	VRAMAllocationMB int64  `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
-	VLLMArgs       []string `yaml:"vllm_args"`
+	Name             string   `yaml:"name"`
+	Aliases          []string `yaml:"aliases"`
+	LoadAtStartup    bool     `yaml:"load_at_startup"`
+	VRAMAllocationMB int64    `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
+	KVCacheMemoryGB  float64  `yaml:"kv_cache_memory"` // when set, passed as --kv-cache-memory (GiB) and skips --gpu-memory-utilization
+	VLLMArgs         []string `yaml:"vllm_args"`
 }
 
 // loadConfig reads and parses the YAML file at path.

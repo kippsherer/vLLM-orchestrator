@@ -167,6 +167,61 @@ func TestValidateConfig(t *testing.T) {
 	}
 }
 
+func TestModelConfigKVCacheMemory(t *testing.T) {
+	t.Parallel()
+
+	t.Run("kv_cache_memory_set", func(t *testing.T) {
+		t.Parallel()
+		y := `
+listen: ":8000"
+vllm_socket_dir: "/tmp/x"
+queue_depth: 10
+ttl_active: 5m
+ttl_inactive: 30m
+ttl_unused: 60m
+gpu_groups:
+  - id: "g0"
+    gpus: [0]
+models:
+  - name: "test-model"
+    vram_allocation: 20000
+    kv_cache_memory: 18.5
+`
+		cfg, err := loadConfig(writeTempYAML(t, y))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Models[0].KVCacheMemoryGB != 18.5 {
+			t.Errorf("KVCacheMemoryGB = %v, want 18.5", cfg.Models[0].KVCacheMemoryGB)
+		}
+	})
+
+	t.Run("kv_cache_memory_absent", func(t *testing.T) {
+		t.Parallel()
+		y := `
+listen: ":8000"
+vllm_socket_dir: "/tmp/x"
+queue_depth: 10
+ttl_active: 5m
+ttl_inactive: 30m
+ttl_unused: 60m
+gpu_groups:
+  - id: "g0"
+    gpus: [0]
+models:
+  - name: "test-model"
+    vram_allocation: 20000
+`
+		cfg, err := loadConfig(writeTempYAML(t, y))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Models[0].KVCacheMemoryGB != 0 {
+			t.Errorf("KVCacheMemoryGB = %v, want 0", cfg.Models[0].KVCacheMemoryGB)
+		}
+	})
+}
+
 // writeTempYAML writes content to a temp file and returns its path.
 func writeTempYAML(t *testing.T, content string) string {
 	t.Helper()

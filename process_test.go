@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -248,6 +249,56 @@ func TestCheckSocketOwned(t *testing.T) {
 			t.Error("expected non-nil error, got nil")
 		}
 	})
+}
+
+func TestLaunchVLLMMemoryArgs(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name             string
+		kvCacheMemoryGB  float64
+		vramAllocationMB int64
+		totalVRAMMB      int64
+		wantFlag         string
+		wantVal          string
+	}{
+		{
+			name:            "kv_cache_memory_set",
+			kvCacheMemoryGB: 18.5,
+			wantFlag:        "--kv-cache-memory",
+			wantVal:         "18.5",
+		},
+		{
+			name:             "gpu_memory_utilization_fallback",
+			kvCacheMemoryGB:  0,
+			vramAllocationMB: 20480,
+			totalVRAMMB:      24576,
+			wantFlag:         "--gpu-memory-utilization",
+			wantVal:          "0.83",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var memArg []string
+			if tc.kvCacheMemoryGB > 0 {
+				memArg = []string{"--kv-cache-memory", fmt.Sprintf("%.1f", tc.kvCacheMemoryGB)}
+			} else {
+				memArg = []string{"--gpu-memory-utilization", fmt.Sprintf("%.2f", float64(tc.vramAllocationMB)/float64(tc.totalVRAMMB))}
+			}
+			if len(memArg) != 2 {
+				t.Fatalf("memArg len = %d, want 2", len(memArg))
+			}
+			if memArg[0] != tc.wantFlag {
+				t.Errorf("flag = %q, want %q", memArg[0], tc.wantFlag)
+			}
+			if memArg[1] != tc.wantVal {
+				t.Errorf("value = %q, want %q", memArg[1], tc.wantVal)
+			}
+		})
+	}
 }
 
 func TestDrainAndMeasureNilMem(t *testing.T) {

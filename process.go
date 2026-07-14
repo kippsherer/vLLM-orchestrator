@@ -49,11 +49,16 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 	cudaVisible := strings.Join(visibleDevs, ",")
 	tpSize := strconv.Itoa(len(group.gpus))
 
-	args := append([]string{"serve", modelCfg.Name,
+	var memArg []string
+	if modelCfg.KVCacheMemoryGB > 0 {
+		memArg = []string{"--kv-cache-memory", fmt.Sprintf("%.1f", modelCfg.KVCacheMemoryGB)}
+	} else {
+		memArg = []string{"--gpu-memory-utilization", fmt.Sprintf("%.2f", float64(modelCfg.VRAMAllocationMB)/float64(group.measuredTotalVRAMMB))}
+	}
+	args := append(append([]string{"serve", modelCfg.Name,
 		"--uds", socketPath,
 		"--tensor-parallel-size", tpSize,
-		"--gpu-memory-utilization", fmt.Sprintf("%.2f", float64(modelCfg.VRAMAllocationMB)/float64(group.measuredTotalVRAMMB)),
-	}, modelCfg.VLLMArgs...)
+	}, memArg...), modelCfg.VLLMArgs...)
 
 	cmd := exec.Command("vllm", args...)
 	cmd.Env = buildEnv(cudaVisible)
