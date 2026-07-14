@@ -19,16 +19,18 @@ func TestBuildEnv(t *testing.T) {
 	os.Setenv("CUDA_VISIBLE_DEVICES", "old_value")
 	os.Setenv("VLLM_SERVER_DEV_MODE", "old_value")
 	os.Setenv("OMP_NUM_THREADS", "36")
+	os.Setenv("LD_PRELOAD", "/old/lib.so")
 	t.Cleanup(func() {
 		os.Unsetenv("CUDA_VISIBLE_DEVICES")
 		os.Unsetenv("VLLM_SERVER_DEV_MODE")
 		os.Unsetenv("OMP_NUM_THREADS")
+		os.Unsetenv("LD_PRELOAD")
 	})
 
 	result := buildEnv("0,1")
 
-	var cudaVal, devModeVal, ompVal string
-	cudaCount, devModeCount, ompCount := 0, 0, 0
+	var cudaVal, devModeVal, ompVal, ldPreloadVal string
+	cudaCount, devModeCount, ompCount, ldPreloadCount := 0, 0, 0, 0
 	for _, kv := range result {
 		if strings.HasPrefix(kv, "CUDA_VISIBLE_DEVICES=") {
 			cudaVal = strings.TrimPrefix(kv, "CUDA_VISIBLE_DEVICES=")
@@ -42,6 +44,10 @@ func TestBuildEnv(t *testing.T) {
 			ompVal = strings.TrimPrefix(kv, "OMP_NUM_THREADS=")
 			ompCount++
 		}
+		if strings.HasPrefix(kv, "LD_PRELOAD=") {
+			ldPreloadVal = strings.TrimPrefix(kv, "LD_PRELOAD=")
+			ldPreloadCount++
+		}
 	}
 	if cudaCount != 1 {
 		t.Errorf("CUDA_VISIBLE_DEVICES appears %d times, want 1", cudaCount)
@@ -52,14 +58,20 @@ func TestBuildEnv(t *testing.T) {
 	if ompCount != 1 {
 		t.Errorf("OMP_NUM_THREADS appears %d times, want 1", ompCount)
 	}
+	if ldPreloadCount != 1 {
+		t.Errorf("LD_PRELOAD appears %d times, want 1", ldPreloadCount)
+	}
 	if cudaVal != "0,1" {
 		t.Errorf("CUDA_VISIBLE_DEVICES = %q, want %q", cudaVal, "0,1")
 	}
 	if devModeVal != "1" {
 		t.Errorf("VLLM_SERVER_DEV_MODE = %q, want %q", devModeVal, "1")
 	}
-	if ompVal != "1" {
-		t.Errorf("OMP_NUM_THREADS = %q, want %q (parent value must be overridden)", ompVal, "1")
+	if ompVal != "8" {
+		t.Errorf("OMP_NUM_THREADS = %q, want %q (parent value must be overridden)", ompVal, "8")
+	}
+	if ldPreloadVal != "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4" {
+		t.Errorf("LD_PRELOAD = %q, want %q (parent value must be overridden)", ldPreloadVal, "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4")
 	}
 }
 
