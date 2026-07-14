@@ -107,19 +107,20 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 // models (Qwen, DeepSeek, etc.), reducing tokenization overhead.
 func buildEnv(cudaVisible string) []string {
 	base := os.Environ()
-	out := make([]string, 0, len(base)+6)
+	out := make([]string, 0, len(base)+7)
 	for _, kv := range base {
 		k := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			k = kv[:i]
 		}
-		if k == "CUDA_VISIBLE_DEVICES" || k == "VLLM_SERVER_DEV_MODE" || k == "OMP_NUM_THREADS" || k == "VLLM_CPU_OMP_THREADS_BIND" || k == "LD_PRELOAD" || k == "VLLM_USE_FASTOKENS" {
+		if k == "CUDA_VISIBLE_DEVICES" || k == "CUDA_DEVICE_ORDER" || k == "VLLM_SERVER_DEV_MODE" || k == "OMP_NUM_THREADS" || k == "VLLM_CPU_OMP_THREADS_BIND" || k == "LD_PRELOAD" || k == "VLLM_USE_FASTOKENS" {
 			continue
 		}
 		out = append(out, kv)
 	}
 	out = append(out,
 		"CUDA_VISIBLE_DEVICES="+cudaVisible,
+		"CUDA_DEVICE_ORDER=PCI_BUS_ID",
 		"VLLM_SERVER_DEV_MODE=1",
 		"OMP_NUM_THREADS=8",
 		"VLLM_CPU_OMP_THREADS_BIND=auto",
