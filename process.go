@@ -89,24 +89,26 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 }
 
 // buildEnv constructs the subprocess environment from the current env,
-// injecting CUDA_VISIBLE_DEVICES, VLLM_SERVER_DEV_MODE=1, and OMP_NUM_THREADS=1.
-// OMP_NUM_THREADS is pinned to 1 to suppress vLLM's "Reducing Torch parallelism"
-// warning; vLLM's EngineCore runs single-threaded CPU work and gains nothing from
-// extra OpenMP threads.
+// injecting CUDA_VISIBLE_DEVICES, VLLM_SERVER_DEV_MODE=1, OMP_NUM_THREADS=8,
+// and VLLM_CPU_OMP_THREADS_BIND=auto.
+// OMP_NUM_THREADS=8 allows each GPU worker to spread PyTorch CPU ops (input
+// tensor prep, attention assembly, sampling, KV cache) across multiple cores.
+// VLLM_CPU_OMP_THREADS_BIND=auto lets vLLM pin those threads to cores local to
+// each worker's GPU NUMA node.
 func buildEnv(cudaVisible string) []string {
 	base := os.Environ()
-	out := make([]string, 0, len(base)+3)
+	out := make([]string, 0, len(base)+4)
 	for _, kv := range base {
 		k := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			k = kv[:i]
 		}
-		if k == "CUDA_VISIBLE_DEVICES" || k == "VLLM_SERVER_DEV_MODE" || k == "OMP_NUM_THREADS" {
+		if k == "CUDA_VISIBLE_DEVICES" || k == "VLLM_SERVER_DEV_MODE" || k == "OMP_NUM_THREADS" || k == "VLLM_CPU_OMP_THREADS_BIND" {
 			continue
 		}
 		out = append(out, kv)
 	}
-	out = append(out, "CUDA_VISIBLE_DEVICES="+cudaVisible, "VLLM_SERVER_DEV_MODE=1", "OMP_NUM_THREADS=1")
+	out = append(out, "CUDA_VISIBLE_DEVICES="+cudaVisible, "VLLM_SERVER_DEV_MODE=1", "OMP_NUM_THREADS=8", "VLLM_CPU_OMP_THREADS_BIND=auto")
 	return out
 }
 
