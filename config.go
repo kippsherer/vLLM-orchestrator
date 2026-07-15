@@ -32,6 +32,7 @@ type ModelConfig struct {
 	Name             string        `yaml:"name"`
 	Aliases          []string      `yaml:"aliases"`
 	LoadAtStartup    bool          `yaml:"load_at_startup"`
+	GPUGroup         string        `yaml:"gpu_group"`      // when set, pins this model to the named gpu_group
 	VRAMAllocationMB int64         `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
 	KVCacheMemoryGB  float64       `yaml:"kv_cache_memory"` // when set, passed as --kv-cache-memory (GiB) and skips --gpu-memory-utilization
 	TTLActive        time.Duration `yaml:"ttl_active"`      // overrides global ttl_active when > 0
@@ -106,6 +107,10 @@ func validateConfig(cfg *Config) error {
 	}
 
 	// Duplicate model names or aliases.
+	groupIDs := make(map[string]struct{})
+	for _, g := range cfg.GPUGroups {
+		groupIDs[g.ID] = struct{}{}
+	}
 	names := make(map[string]struct{})
 	for _, m := range cfg.Models {
 		if m.Name == "" {
@@ -120,6 +125,12 @@ func validateConfig(cfg *Config) error {
 				return fmt.Errorf("config: duplicate model name/alias %q", a)
 			}
 			names[a] = struct{}{}
+		}
+		// Per-model gpu_group pin must reference a declared group.
+		if m.GPUGroup != "" {
+			if _, ok := groupIDs[m.GPUGroup]; !ok {
+				return fmt.Errorf("config: model %q: gpu_group %q not found in gpu_groups", m.Name, m.GPUGroup)
+			}
 		}
 		// Per-model TTL overrides must be self-consistent when set.
 		eff := func(modelVal, globalVal time.Duration) time.Duration {

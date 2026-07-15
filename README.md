@@ -127,8 +127,15 @@ models:
   - name: "meta-llama/Meta-Llama-3-8B-Instruct"
     aliases: ["llama3-8b", "llama3"]   # optional; any alias routes to this model
     load_at_startup: true              # optional; load immediately on orchestrator start
+    gpu_group: "group0"               # optional; pin this model to a specific gpu_group,
+                                       # bypassing the automatic smallest-fit scheduler
     vram_allocation: 75162             # MB this model is allowed to consume on the group;
                                        # --gpu-memory-utilization is derived from this automatically
+    kv_cache_memory: 12.0              # optional; when set, passed as --kv-cache-memory (GiB)
+                                       # instead of deriving --gpu-memory-utilization
+    ttl_active: 5m                     # optional; overrides global ttl_active for this model
+    ttl_inactive: 30m                  # optional; overrides global ttl_inactive for this model
+    ttl_unused: 60m                    # optional; overrides global ttl_unused for this model
     vllm_args:                         # passed verbatim to `vllm serve`
       - "--dtype=float16"
       - "--max-model-len=8192"
@@ -152,15 +159,19 @@ models:
 
 **Models**
 - `vram_allocation` is the number of MB this model is allowed to consume across all GPUs in its group. The orchestrator derives `--gpu-memory-utilization` from this value automatically at launch time. Set it to `gpu_memory_utilization × total_group_vram_mb` for your hardware.
+- `kv_cache_memory` (optional) sets `--kv-cache-memory` in GiB directly instead of deriving `--gpu-memory-utilization`. Use this when vLLM's profiling approach is preferable to utilization-based allocation.
 - `aliases` are additional names clients may use in the `"model"` field. `/v1/models` always returns the canonical name.
 - `load_at_startup` is optional (default `false`). When `true`, the model begins loading when the orchestrator starts.
+- `gpu_group` (optional) pins the model to the named GPU group, bypassing the automatic smallest-fit scheduler entirely. The named group must exist in `gpu_groups`. When unset, the scheduler assigns the model to the smallest group that has sufficient free VRAM.
+- `ttl_active`, `ttl_inactive`, `ttl_unused` (optional) override the global TTL values for this model individually. Any combination may be set; omitted values fall back to the global setting. The effective values must satisfy `ttl_active < ttl_inactive < ttl_unused` — startup aborts if violated.
 - `vllm_args` are appended to `vllm serve <model_name>` verbatim. **Do not include** `--uds`, `--tensor-parallel-size`, `--gpu-memory-utilization`, or `CUDA_VISIBLE_DEVICES` — these are injected automatically.
 
 **HuggingFace gated models**
 - Set `HF_TOKEN` in the orchestrator's environment. It is forwarded into each vLLM subprocess automatically. It is never written to config or logs.
 
 **TTL ordering requirement**
-- `ttl_active < ttl_inactive < ttl_unused` — startup aborts if violated.
+- Global: `ttl_active < ttl_inactive < ttl_unused` — startup aborts if violated.
+- Per-model: effective values (per-model override or global fallback) must also satisfy the same ordering — startup aborts if violated.
 
 ---
 
@@ -212,7 +223,8 @@ The orchestrator aborts at startup if:
 - Any configured GPU device ID is not found in `nvidia-smi` output
 - GPU device IDs are duplicated across groups
 - Model names or aliases are duplicated
-- `ttl_active >= ttl_inactive` or `ttl_inactive >= ttl_unused`
+- A model's `gpu_group` names a group not declared in `gpu_groups`
+- `ttl_active >= ttl_inactive` or `ttl_inactive >= ttl_unused` (global or effective per-model)
 - `vllm_socket_dir` is not writable
 
 ---

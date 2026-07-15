@@ -9,8 +9,28 @@ import (
 
 // assignGroup finds the smallest GPU group whose total VRAM can hold the model,
 // running freeMemoryRules on each candidate group until one has enough free VRAM.
-// Reserves VRAM on success.
+// Reserves VRAM on success. If the model config specifies a gpu_group, that group
+// is used directly, bypassing the smallest-fit selection logic.
 func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
+	// Per-model GPU group pin: skip scheduling logic entirely.
+	if me.cfg.GPUGroup != "" {
+		for i, gs := range o.ms.groups {
+			if gs.id == me.cfg.GPUGroup {
+				if o.groupHasOtherModels(i, me) {
+					o.freeMemoryRules(gs, me.cfg.VRAMAllocationMB)
+				}
+				refreshMemory(o.ms)
+				o.ms.mu.Lock()
+				o.ms.groups[i].measuredFreeMB -= me.cfg.VRAMAllocationMB
+				o.ms.mu.Unlock()
+				me.reservedVRAMMB = me.cfg.VRAMAllocationMB
+				log.Printf("[scheduler] model %s pinned to group %s", me.cfg.Name, me.cfg.GPUGroup)
+				return i, nil
+			}
+		}
+		return -1, fmt.Errorf("assign group: pinned group %q not found", me.cfg.GPUGroup)
+	}
+
 	var needed int64
 	if me.mem.measured {
 		needed = me.mem.fullKVVRAMMB
