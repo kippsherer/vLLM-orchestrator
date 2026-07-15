@@ -29,12 +29,15 @@ type GPUGroup struct {
 
 // ModelConfig is the per-model entry from the YAML file.
 type ModelConfig struct {
-	Name             string   `yaml:"name"`
-	Aliases          []string `yaml:"aliases"`
-	LoadAtStartup    bool     `yaml:"load_at_startup"`
-	VRAMAllocationMB int64    `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
-	KVCacheMemoryGB  float64  `yaml:"kv_cache_memory"` // when set, passed as --kv-cache-memory (GiB) and skips --gpu-memory-utilization
-	VLLMArgs         []string `yaml:"vllm_args"`
+	Name             string        `yaml:"name"`
+	Aliases          []string      `yaml:"aliases"`
+	LoadAtStartup    bool          `yaml:"load_at_startup"`
+	VRAMAllocationMB int64         `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
+	KVCacheMemoryGB  float64       `yaml:"kv_cache_memory"` // when set, passed as --kv-cache-memory (GiB) and skips --gpu-memory-utilization
+	TTLActive        time.Duration `yaml:"ttl_active"`      // overrides global ttl_active when > 0
+	TTLInactive      time.Duration `yaml:"ttl_inactive"`    // overrides global ttl_inactive when > 0
+	TTLUnused        time.Duration `yaml:"ttl_unused"`      // overrides global ttl_unused when > 0
+	VLLMArgs         []string      `yaml:"vllm_args"`
 }
 
 // loadConfig reads and parses the YAML file at path.
@@ -117,6 +120,22 @@ func validateConfig(cfg *Config) error {
 				return fmt.Errorf("config: duplicate model name/alias %q", a)
 			}
 			names[a] = struct{}{}
+		}
+		// Per-model TTL overrides must be self-consistent when set.
+		eff := func(modelVal, globalVal time.Duration) time.Duration {
+			if modelVal > 0 {
+				return modelVal
+			}
+			return globalVal
+		}
+		effActive := eff(m.TTLActive, cfg.TTLActive)
+		effInactive := eff(m.TTLInactive, cfg.TTLInactive)
+		effUnused := eff(m.TTLUnused, cfg.TTLUnused)
+		if effActive >= effInactive {
+			return fmt.Errorf("config: model %q: effective ttl_active (%v) must be < ttl_inactive (%v)", m.Name, effActive, effInactive)
+		}
+		if effInactive >= effUnused {
+			return fmt.Errorf("config: model %q: effective ttl_inactive (%v) must be < ttl_unused (%v)", m.Name, effInactive, effUnused)
 		}
 	}
 

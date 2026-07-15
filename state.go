@@ -126,9 +126,20 @@ func (o *orchestrator) tickTTL(me *modelEntry) {
 	idle := time.Since(me.lastCompleted)
 	me.mu.Unlock()
 
+	// Resolve effective TTL: per-model override takes precedence over global.
+	effTTL := func(modelVal, globalVal time.Duration) time.Duration {
+		if modelVal > 0 {
+			return modelVal
+		}
+		return globalVal
+	}
+	ttlActive := effTTL(me.cfg.TTLActive, o.cfg.TTLActive)
+	ttlInactive := effTTL(me.cfg.TTLInactive, o.cfg.TTLInactive)
+	ttlUnused := effTTL(me.cfg.TTLUnused, o.cfg.TTLUnused)
+
 	switch state {
 	case stateActive:
-		if activeReqs > 0 || idle < o.cfg.TTLActive {
+		if activeReqs > 0 || idle < ttlActive {
 			return
 		}
 		// Transition ACTIVE → SLEEP1 or SLEEP2 depending on CPU RAM.
@@ -153,7 +164,7 @@ func (o *orchestrator) tickTTL(me *modelEntry) {
 		}
 
 	case stateSleep1:
-		if activeReqs > 0 || idle < o.cfg.TTLInactive {
+		if activeReqs > 0 || idle < ttlInactive {
 			return
 		}
 		me.mu.Lock()
@@ -166,7 +177,7 @@ func (o *orchestrator) tickTTL(me *modelEntry) {
 		o.transitionToSleep(me, proc, 2)
 
 	case stateSleep2:
-		if activeReqs > 0 || idle < o.cfg.TTLUnused {
+		if activeReqs > 0 || idle < ttlUnused {
 			return
 		}
 		me.mu.Lock()
