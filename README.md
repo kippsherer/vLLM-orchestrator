@@ -131,7 +131,7 @@ models:
                                        # bypassing the automatic smallest-fit scheduler
     vram_allocation: 75162             # MB this model is allowed to consume on the group;
                                        # --gpu-memory-utilization is derived from this automatically
-    kv_cache_memory: 12.0              # optional; when set, passed as --kv-cache-memory (GiB)
+    kv_cache_memory: 12.0              # optional; when set, passed as --kv-cache-memory-bytes (GiB)
                                        # instead of deriving --gpu-memory-utilization
     ttl_active: 5m                     # optional; overrides global ttl_active for this model
     ttl_inactive: 30m                  # optional; overrides global ttl_inactive for this model
@@ -159,7 +159,7 @@ models:
 
 **Models**
 - `vram_allocation` is the number of MB this model is allowed to consume across all GPUs in its group. The orchestrator derives `--gpu-memory-utilization` from this value automatically at launch time. Set it to `gpu_memory_utilization × total_group_vram_mb` for your hardware.
-- `kv_cache_memory` (optional) sets `--kv-cache-memory` in GiB directly instead of deriving `--gpu-memory-utilization`. Use this when vLLM's profiling approach is preferable to utilization-based allocation.
+- `kv_cache_memory` (optional) sets `--kv-cache-memory-bytes` in GiB directly instead of deriving `--gpu-memory-utilization`. Use this when vLLM's profiling approach is preferable to utilization-based allocation.
 - `aliases` are additional names clients may use in the `"model"` field. `/v1/models` always returns the canonical name.
 - `load_at_startup` is optional (default `false`). When `true`, the model begins loading when the orchestrator starts.
 - `gpu_group` (optional) pins the model to the named GPU group, bypassing the automatic smallest-fit scheduler entirely. The named group must exist in `gpu_groups`. When unset, the scheduler assigns the model to the smallest group that has sufficient free VRAM.
