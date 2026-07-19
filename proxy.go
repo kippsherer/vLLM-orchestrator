@@ -202,44 +202,10 @@ func peekModel(r *http.Request) (string, []byte, error) {
 // rewriteModelField returns a copy of buf with the top-level "model" string
 // value replaced by canonicalName. All other bytes are preserved verbatim.
 func rewriteModelField(buf []byte, canonicalName string) []byte {
-	key := []byte(`"model"`)
-	i := bytes.Index(buf, key)
-	if i < 0 {
+	valueStart, valueEnd, _, ok := locateTopLevelModelValue(buf)
+	if !ok {
 		return buf
 	}
-	i += len(key)
-	// Skip whitespace and colon.
-	for i < len(buf) && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r') {
-		i++
-	}
-	if i >= len(buf) || buf[i] != ':' {
-		return buf
-	}
-	i++
-	for i < len(buf) && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r') {
-		i++
-	}
-	if i >= len(buf) || buf[i] != '"' {
-		return buf
-	}
-	// valueStart is the opening quote of the current model value.
-	valueStart := i
-	i++ // skip opening quote
-	for i < len(buf) {
-		c := buf[i]
-		if c == '"' {
-			break
-		}
-		if c == '\\' {
-			i++ // skip escaped char
-		}
-		i++
-	}
-	if i >= len(buf) {
-		return buf
-	}
-	// valueEnd is the closing quote (inclusive).
-	valueEnd := i
 
 	// Build replacement: everything before valueStart + quoted canonical name + everything after valueEnd.
 	quoted := make([]byte, 0, len(canonicalName)+2)
@@ -247,54 +213,72 @@ func rewriteModelField(buf []byte, canonicalName string) []byte {
 	quoted = append(quoted, []byte(canonicalName)...)
 	quoted = append(quoted, '"')
 
-	out := make([]byte, 0, len(buf)-int(valueEnd-valueStart)+len(quoted))
+	out := make([]byte, 0, len(buf)-(valueEnd-valueStart)+len(quoted))
 	out = append(out, buf[:valueStart]...)
 	out = append(out, quoted...)
 	out = append(out, buf[valueEnd+1:]...)
 	return out
 }
 
-// extractModelField performs a minimal scan of a JSON byte slice to find the
-// top-level "model" string value without using encoding/json (which would
-// drop unknown fields on re-serialization).
+// locateTopLevelModelValue finds the top-level "model" key in data using
+// encoding/json's streaming decoder (Token/More/Decode), so the literal
+// string "model" appearing inside nested arrays/objects/values is never
+// mistaken for the top-level key, and returns its already-unescaped string
+// value along with the inclusive byte range [valueStart, valueEnd] of the
+// quoted literal in the original buffer (for callers that need to splice the
+// original bytes rather than re-serialize them). ok is false if the top
+// level isn't a JSON object, has no "model" key, or the value isn't a string.
+func locateTopLevelModelValue(data []byte) (valueStart, valueEnd int, value string, ok bool) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return 0, 0, "", false
+	}
+	if d, isDelim := tok.(json.Delim); !isDelim || d != '{' {
+		return 0, 0, "", false
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return 0, 0, "", false
+		}
+		key, isString := keyTok.(string)
+		if !isString {
+			return 0, 0, "", false
+		}
+		if key != "model" {
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return 0, 0, "", false
+			}
+			continue
+		}
+		afterKey := int(dec.InputOffset())
+		valTok, err := dec.Token()
+		if err != nil {
+			return 0, 0, "", false
+		}
+		val, isString := valTok.(string)
+		if !isString {
+			return 0, 0, "", false
+		}
+		valueEnd = int(dec.InputOffset()) - 1 // last byte of the token = closing quote
+		valueStart = afterKey + bytes.IndexByte(data[afterKey:], '"')
+		return valueStart, valueEnd, val, true
+	}
+	return 0, 0, "", false
+}
+
+// extractModelField finds the top-level "model" string value in a JSON body,
+// fully delegating parsing (including escape decoding) to encoding/json via
+// locateTopLevelModelValue so occurrences of the literal string "model"
+// inside nested arrays/objects cannot be confused with the top-level key.
 func extractModelField(data []byte) string {
-	// Find `"model"` key at top level (depth 0 after the opening `{`).
-	key := []byte(`"model"`)
-	i := bytes.Index(data, key)
-	if i < 0 {
+	_, _, value, ok := locateTopLevelModelValue(data)
+	if !ok {
 		return ""
 	}
-	i += len(key)
-	// Skip whitespace and colon.
-	for i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\n' || data[i] == '\r') {
-		i++
-	}
-	if i >= len(data) || data[i] != ':' {
-		return ""
-	}
-	i++
-	for i < len(data) && (data[i] == ' ' || data[i] == '\t' || data[i] == '\n' || data[i] == '\r') {
-		i++
-	}
-	if i >= len(data) || data[i] != '"' {
-		return ""
-	}
-	i++ // skip opening quote
-	var sb strings.Builder
-	for i < len(data) {
-		c := data[i]
-		if c == '"' {
-			break
-		}
-		if c == '\\' && i+1 < len(data) {
-			i++
-			sb.WriteByte(data[i])
-		} else {
-			sb.WriteByte(c)
-		}
-		i++
-	}
-	return sb.String()
+	return value
 }
 
 // serveModels implements GET /v1/models: aggregates from running instances
@@ -306,7 +290,7 @@ func (o *orchestrator) serveModels(w http.ResponseWriter, r *http.Request) {
 		Created           int64  `json:"created"`
 		OwnedBy           string `json:"owned_by"`
 		OrchestratorState string `json:"orchestrator_state"`
-		AllocatedVRAMMB   int64 `json:"allocated_vram_mb,omitempty"`
+		AllocatedVRAMMB   int64  `json:"allocated_vram_mb,omitempty"`
 	}
 	type modelsResp struct {
 		Object string        `json:"object"`

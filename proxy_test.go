@@ -25,7 +25,9 @@ func TestExtractModelField(t *testing.T) {
 		{"empty body", `{}`, ""},
 		{"empty input", ``, ""},
 		{"value not a string", `{"model":123}`, ""},
-		{"model in nested object", `{"data":{"model":"nested"},"model":"top"}`, "nested"},
+		{"model in nested object", `{"data":{"model":"nested"},"model":"top"}`, "top"},
+		{"model as array element before real key", `{"input":["file","function","package","constant","model","type","struct","variable","interface","project"],"model":"embedding","encoding_format":"float"}`, "embedding"},
+		{"json escape sequences decoded correctly", `{"model":"a\nb\u002Fc"}`, "a\nb/c"},
 	}
 	for _, tc := range cases {
 		tc := tc
