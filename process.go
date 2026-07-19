@@ -26,8 +26,9 @@ var (
 type vllmProcess struct {
 	cmd        *exec.Cmd
 	socketPath string
-	client     *http.Client // HTTP client dialling the Unix socket
-	onExit     func()       // called exactly once when the process exits for any reason
+	client     *http.Client  // HTTP client dialling the Unix socket
+	exited     chan struct{} // closed when the OS process exits, for any reason
+	onExit     func()        // called exactly once when the process exits for any reason
 }
 
 // launchVLLM starts a vLLM subprocess for modelCfg on gpuGroup and returns
@@ -82,13 +83,18 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 	}
 	client := &http.Client{Transport: transport}
 
-	vp := &vllmProcess{cmd: cmd, socketPath: socketPath, client: client}
+	vp := &vllmProcess{cmd: cmd, socketPath: socketPath, client: client, exited: make(chan struct{})}
 
 	go drainAndMeasure(stdout, modelCfg.Name, mem)
 	go drainAndMeasure(stderr, modelCfg.Name, nil)
-	// Reap the top-level process to avoid zombies. VRAM accounting is NOT
-	// driven by this — vLLM's worker children outlive the parent process.
-	go cmd.Wait()
+	// Reap the top-level process to avoid zombies and signal waitForHealth
+	// (via vp.exited) the moment it exits, rather than leaving the health
+	// poll to discover this only after its full timeout. VRAM accounting is
+	// NOT driven by this — vLLM's worker children outlive the parent process.
+	go func() {
+		cmd.Wait()
+		close(vp.exited)
+	}()
 
 	return vp, nil
 }
@@ -169,10 +175,14 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory) {
 	}
 }
 
-// waitForHealth polls GET /health on the vLLM process until 200 or 3600s timeout.
-// Returns nil when ready. On timeout, kills the process and removes the socket.
+// waitForHealth polls GET /health on the vLLM process until 200 or 3600s
+// timeout. Returns nil when ready. Fails immediately (without waiting out the
+// timeout) if the process exits before becoming healthy. On timeout with the
+// process still alive, kills it and removes the socket.
 func waitForHealth(vp *vllmProcess, modelName string) error {
 	deadline := time.Now().Add(3600 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 	for time.Now().Before(deadline) {
 		resp, err := vp.client.Get("http://vllm/health")
 		if err == nil {
@@ -181,7 +191,11 @@ func waitForHealth(vp *vllmProcess, modelName string) error {
 				return nil
 			}
 		}
-		time.Sleep(2 * time.Second)
+		select {
+		case <-vp.exited:
+			return fmt.Errorf("vllm %q: process exited before becoming healthy", modelName)
+		case <-ticker.C:
+		}
 	}
 	killProcess(vp, modelName)
 	return fmt.Errorf("vllm %q: health poll timed out after 3600s", modelName)

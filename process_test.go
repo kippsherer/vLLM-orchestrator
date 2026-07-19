@@ -316,3 +316,30 @@ func TestDrainAndMeasureNilMem(t *testing.T) {
 	pw.Close()
 	<-done
 }
+
+// TestWaitForHealthFailsFastOnProcessExit verifies that when the vLLM
+// process exits before ever becoming healthy, waitForHealth returns
+// immediately (via vp.exited) instead of blind-polling for its full 3600s
+// timeout.
+func TestWaitForHealthFailsFastOnProcessExit(t *testing.T) {
+	t.Parallel()
+
+	// A socket path nothing listens on, so every health GET fails.
+	vp := makeTestVLLMProcess(t.TempDir() + "/nonexistent.sock")
+	vp.exited = make(chan struct{})
+	close(vp.exited) // simulate the process having already exited
+
+	start := time.Now()
+	err := waitForHealth(vp, "test-model")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error when process exited before becoming healthy, got nil")
+	}
+	if !strings.Contains(err.Error(), "exited before becoming healthy") {
+		t.Errorf("error = %v, want it to mention process exit", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("waitForHealth took %v, want it to fail fast (well under the 3600s timeout)", elapsed)
+	}
+}
