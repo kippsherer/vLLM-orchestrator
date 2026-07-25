@@ -32,9 +32,9 @@ type ModelConfig struct {
 	Name             string        `yaml:"name"`
 	Aliases          []string      `yaml:"aliases"`
 	LoadAtStartup    bool          `yaml:"load_at_startup"`
-	GPUGroup         string        `yaml:"gpu_group"`      // when set, pins this model to the named gpu_group
+	GPUGroup         string        `yaml:"gpu_group"`       // when set, pins this model to the named gpu_group
 	VRAMAllocationMB int64         `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
-	KVCacheMemoryGB  float64       `yaml:"kv_cache_memory"` // when set, passed as --kv-cache-memory-bytes (GiB, e.g. "10G" binary suffix) and skips --gpu-memory-utilization
+	KVCacheMemoryGB  float64       `yaml:"kv_cache_memory"` // when set, passed as --kv-cache-memory-bytes (GiB, e.g. "10g") and skips --gpu-memory-utilization
 	TTLActive        time.Duration `yaml:"ttl_active"`      // overrides global ttl_active when > 0
 	TTLInactive      time.Duration `yaml:"ttl_inactive"`    // overrides global ttl_inactive when > 0
 	TTLUnused        time.Duration `yaml:"ttl_unused"`      // overrides global ttl_unused when > 0

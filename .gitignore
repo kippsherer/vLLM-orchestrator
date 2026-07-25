@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Compiled orchestrator binary (go build output, module-name default)
+/vLLM-orchestrator
+
 # Test binary, built with `go test -c`
 *.test
 

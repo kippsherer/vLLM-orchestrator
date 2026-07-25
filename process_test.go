@@ -266,7 +266,7 @@ func TestLaunchVLLMMemoryArgs(t *testing.T) {
 			name:            "kv_cache_memory_set",
 			kvCacheMemoryGB: 18.5,
 			wantFlag:        "--kv-cache-memory-bytes",
-			wantVal:         "18.5G",
+			wantVal:         "18.5g",
 		},
 		{
 			name:             "gpu_memory_utilization_fallback",
@@ -276,6 +276,12 @@ func TestLaunchVLLMMemoryArgs(t *testing.T) {
 			wantFlag:         "--gpu-memory-utilization",
 			wantVal:          "0.83",
 		},
+		{
+			name:            "kv_cache_memory_whole_number",
+			kvCacheMemoryGB: 11,
+			wantFlag:        "--kv-cache-memory-bytes",
+			wantVal:         "11g",
+		},
 	}
 
 	for _, tc := range cases {
@@ -284,7 +290,7 @@ func TestLaunchVLLMMemoryArgs(t *testing.T) {
 			t.Parallel()
 			var memArg []string
 			if tc.kvCacheMemoryGB > 0 {
-				memArg = []string{"--kv-cache-memory-bytes", fmt.Sprintf("%gG", tc.kvCacheMemoryGB)}
+				memArg = []string{"--kv-cache-memory-bytes", fmt.Sprintf("%gg", tc.kvCacheMemoryGB)}
 			} else {
 				memArg = []string{"--gpu-memory-utilization", fmt.Sprintf("%.2f", float64(tc.vramAllocationMB)/float64(tc.totalVRAMMB))}
 			}
