@@ -37,19 +37,20 @@ type GPUGroup struct {
 
 // ModelConfig is the per-model entry from the YAML file.
 type ModelConfig struct {
-	Name             string        `yaml:"name"`
-	Aliases          []string      `yaml:"aliases"`
-	Engine           string        `yaml:"engine"` // "" or "vllm" (default) | "llama_cpp"
-	LoadAtStartup    bool          `yaml:"load_at_startup"`
-	GPUGroup         string        `yaml:"gpu_group"`       // when set, pins this model to the named gpu_group
-	VRAMAllocationMB int64         `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group
-	KVCacheMemoryGB  float64       `yaml:"kv_cache_memory"` // vLLM only; passed as --kv-cache-memory-bytes (GiB)
-	TTLActive        time.Duration `yaml:"ttl_active"`      // overrides global ttl_active when > 0
-	TTLInactive      time.Duration `yaml:"ttl_inactive"`    // overrides global ttl_inactive when > 0
-	TTLUnused        time.Duration `yaml:"ttl_unused"`      // overrides global ttl_unused when > 0
-	VLLMArgs         []string      `yaml:"vllm_args"`       // vLLM only
-	GGUFPath         string        `yaml:"gguf_path"`       // llama_cpp only; joined with llama_cpp_model_dir
-	LlamaCppArgs     []string      `yaml:"llama_cpp_args"`  // llama_cpp only; raw passthrough
+	Name               string        `yaml:"name"`
+	Aliases            []string      `yaml:"aliases"`
+	Engine             string        `yaml:"engine"` // "" or "vllm" (default) | "llama_cpp"
+	LoadAtStartup      bool          `yaml:"load_at_startup"`
+	GPUGroup           string        `yaml:"gpu_group"`            // when set, pins this model to the named gpu_group
+	VRAMAllocationMB   int64         `yaml:"vram_allocation"`      // authoritative VRAM this model is allowed to consume on the group
+	KVCacheMemoryGB    float64       `yaml:"kv_cache_memory"`      // vLLM only; passed as --kv-cache-memory-bytes (GiB)
+	TTLActive          time.Duration `yaml:"ttl_active"`           // overrides global ttl_active when > 0
+	TTLInactive        time.Duration `yaml:"ttl_inactive"`         // overrides global ttl_inactive when > 0
+	TTLUnused          time.Duration `yaml:"ttl_unused"`           // overrides global ttl_unused when > 0
+	VLLMArgs           []string      `yaml:"vllm_args"`            // vLLM only
+	TensorParallelSize int           `yaml:"tensor_parallel_size"` // vLLM only; 0 = auto (defaults to len(group.gpus)); overrides when > 0
+	GGUFPath           string        `yaml:"gguf_path"`            // llama_cpp only; joined with llama_cpp_model_dir
+	LlamaCppArgs       []string      `yaml:"llama_cpp_args"`       // llama_cpp only; raw passthrough
 }
 
 // loadConfig reads and parses the YAML file at path.
@@ -116,8 +117,14 @@ func validateConfig(cfg *Config) error {
 
 	// Duplicate model names or aliases per-model validation.
 	groupIDs := make(map[string]struct{})
+	groupGpuCount := make(map[string]int)
+	largestGroupGpus := 0
 	for _, g := range cfg.GPUGroups {
 		groupIDs[g.ID] = struct{}{}
+		groupGpuCount[g.ID] = len(g.GPUs)
+		if len(g.GPUs) > largestGroupGpus {
+			largestGroupGpus = len(g.GPUs)
+		}
 	}
 	names := make(map[string]struct{})
 	hasVLLM := false
@@ -141,6 +148,10 @@ func validateConfig(cfg *Config) error {
 			if _, ok := groupIDs[m.GPUGroup]; !ok {
 				return fmt.Errorf("config: model %q: gpu_group %q not found in gpu_groups", m.Name, m.GPUGroup)
 			}
+		}
+		// TensorParallelSize must be >= 0; not allowed on llama_cpp models.
+		if m.TensorParallelSize < 0 {
+			return fmt.Errorf("config: model %q: tensor_parallel_size must be >= 0", m.Name)
 		}
 		// Engine validation.
 		switch m.Engine {
@@ -178,12 +189,24 @@ func validateConfig(cfg *Config) error {
 			if len(m.VLLMArgs) > 0 {
 				return fmt.Errorf("config: model %q: vllm_args must not be set for llama_cpp engine", m.Name)
 			}
+			if m.TensorParallelSize != 0 {
+				return fmt.Errorf("config: model %q: tensor_parallel_size must not be set for llama_cpp engine", m.Name)
+			}
 		} else {
 			if m.GGUFPath != "" {
 				return fmt.Errorf("config: model %q: gguf_path must not be set for vllm engine", m.Name)
 			}
 			if len(m.LlamaCppArgs) > 0 {
 				return fmt.Errorf("config: model %q: llama_cpp_args must not be set for vllm engine", m.Name)
+			}
+			if m.TensorParallelSize > 0 {
+				if m.GPUGroup != "" {
+					if m.TensorParallelSize > groupGpuCount[m.GPUGroup] {
+						return fmt.Errorf("config: model %q: tensor_parallel_size (%d) exceeds gpu_group %q device count (%d)", m.Name, m.TensorParallelSize, m.GPUGroup, groupGpuCount[m.GPUGroup])
+					}
+				} else if m.TensorParallelSize > largestGroupGpus {
+					return fmt.Errorf("config: model %q: tensor_parallel_size (%d) exceeds largest gpu_group device count (%d)", m.Name, m.TensorParallelSize, largestGroupGpus)
+				}
 			}
 		}
 	}

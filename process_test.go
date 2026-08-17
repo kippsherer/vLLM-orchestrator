@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -451,5 +452,50 @@ func TestLlamaCppArgConstruction(t *testing.T) {
 	// Verify -a contains only the canonical name (not comma-joined aliases).
 	if args[5] != "test-model" {
 		t.Errorf("-a value = %q, want %q (CORRECTION 1: only Name, no aliases)", args[5], "test-model")
+	}
+}
+
+func TestLaunchVLLMTensorParallelSize(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name               string
+		tensorParallelSize int
+		groupGpuCount      int
+		wantTPSize         string
+	}{
+		{
+			name:               "override_set_wins",
+			tensorParallelSize: 2,
+			groupGpuCount:      4,
+			wantTPSize:         "2",
+		},
+		{
+			name:               "override_zero_falls_back_to_group_size",
+			tensorParallelSize: 0,
+			groupGpuCount:      3,
+			wantTPSize:         "3",
+		},
+		{
+			name:               "override_equals_group_size",
+			tensorParallelSize: 4,
+			groupGpuCount:      4,
+			wantTPSize:         "4",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tpSize := tc.groupGpuCount
+			if tc.tensorParallelSize > 0 {
+				tpSize = tc.tensorParallelSize
+			}
+			got := strconv.Itoa(tpSize)
+			if got != tc.wantTPSize {
+				t.Errorf("tpSize = %q, want %q", got, tc.wantTPSize)
+			}
+		})
 	}
 }

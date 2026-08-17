@@ -49,17 +49,27 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 		visibleDevs[i] = strconv.Itoa(d)
 	}
 	cudaVisible := strings.Join(visibleDevs, ",")
-	tpSize := strconv.Itoa(len(group.gpus))
+	tpSize := len(group.gpus)
+	if modelCfg.TensorParallelSize > 0 {
+		tpSize = modelCfg.TensorParallelSize
+	}
+	tpSizeStr := strconv.Itoa(tpSize)
 
 	var memArg []string
 	if modelCfg.KVCacheMemoryGB > 0 {
 		memArg = []string{"--kv-cache-memory-bytes", fmt.Sprintf("%gg", modelCfg.KVCacheMemoryGB)}
 	} else {
-		memArg = []string{"--gpu-memory-utilization", fmt.Sprintf("%.2f", float64(modelCfg.VRAMAllocationMB)/float64(group.measuredTotalVRAMMB))}
+		// --gpu-memory-utilization is a per-device fraction, so the denominator
+		// must reflect only the GPUs vLLM actually uses (tpSize devices), not
+		// group.measuredTotalVRAMMB (all GPUs in the group). These are equal
+		// when tpSize == len(group.gpus) (the pre-override default), so this
+		// is a no-op change for any model not using TensorParallelSize.
+		perGPUVRAMMB := float64(group.measuredTotalVRAMMB) / float64(len(group.gpus))
+		memArg = []string{"--gpu-memory-utilization", fmt.Sprintf("%.2f", float64(modelCfg.VRAMAllocationMB)/(perGPUVRAMMB*float64(tpSize)))}
 	}
 	args := append(append([]string{"serve", modelCfg.Name,
 		"--uds", socketPath,
-		"--tensor-parallel-size", tpSize,
+		"--tensor-parallel-size", tpSizeStr,
 	}, memArg...), modelCfg.VLLMArgs...)
 
 	cmd := exec.Command("vllm", args...)

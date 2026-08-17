@@ -142,6 +142,28 @@ func TestValidateConfig(t *testing.T) {
 				{Name: "m2", Aliases: []string{"alias1"}},
 			}
 		}, "duplicate model name/alias"},
+		{"tensor_parallel_size negative", func(c *Config) {
+			c.Models[0].TensorParallelSize = -1
+		}, "tensor_parallel_size must be >= 0"},
+		{"tensor_parallel_size valid for pinned model", func(c *Config) {
+			c.GPUGroups = []GPUGroup{{ID: "g0", GPUs: []int{0, 1}}}
+			c.Models[0] = ModelConfig{Name: "m1", GPUGroup: "g0", TensorParallelSize: 2}
+		}, ""},
+		{"tensor_parallel_size within pinned group", func(c *Config) {
+			c.GPUGroups = []GPUGroup{{ID: "g0", GPUs: []int{0, 1, 2, 3}}}
+			c.Models[0] = ModelConfig{Name: "m1", GPUGroup: "g0", TensorParallelSize: 2}
+		}, ""},
+		{"tensor_parallel_size exceeds pinned group", func(c *Config) {
+			c.GPUGroups = []GPUGroup{{ID: "g0", GPUs: []int{0, 1}}}
+			c.Models[0] = ModelConfig{Name: "m1", GPUGroup: "g0", TensorParallelSize: 4}
+		}, "tensor_parallel_size (4) exceeds gpu_group"},
+		{"tensor_parallel_size exceeds largest group unpinned", func(c *Config) {
+			c.GPUGroups = []GPUGroup{{ID: "g0", GPUs: []int{0}}, {ID: "g1", GPUs: []int{1, 2}}}
+			c.Models[0] = ModelConfig{Name: "m1", TensorParallelSize: 3}
+		}, "tensor_parallel_size (3) exceeds largest"},
+		{"tensor_parallel_size zero defaults to group size", func(c *Config) {
+			c.Models[0].TensorParallelSize = 0
+		}, ""},
 	}
 
 	for _, tc := range cases {
@@ -218,6 +240,9 @@ func TestValidateConfigLlamaCpp(t *testing.T) {
 		{"llama_cpp vllm_args set", func(c *Config) {
 			c.Models[0].VLLMArgs = []string{"--foo"}
 		}, "vllm_args must not be set"},
+		{"llama_cpp tensor_parallel_size set", func(c *Config) {
+			c.Models[0].TensorParallelSize = 2
+		}, "tensor_parallel_size must not be set"},
 		{"vllm model with gguf_path", func(c *Config) {
 			c.Models[0].Engine = ""
 			c.Models[0].GGUFPath = "test.gguf"
