@@ -173,7 +173,33 @@ models:
 - Global: `ttl_active < ttl_inactive < ttl_unused` — startup aborts if violated.
 - Per-model: effective values (per-model override or global fallback) must also satisfy the same ordering — startup aborts if violated.
 
----
+## Engines
+
+The orchestrator supports two engine backends, selected per-model via the `engine` field:
+
+| Engine | Value | Default? | Lifecycle |
+|---|---|---|---|
+| vLLM | `vllm` (or empty) | Yes | 5 states: UNLOADED → LOADING → ACTIVE → SLEEP1 → SLEEP2 → UNLOADED |
+| llama.cpp | `llama_cpp` | No | 2 states: ACTIVE ↔ UNLOADED |
+
+### vLLM engine
+
+The default engine. Uses `vllm serve <model_name>` under the hood. Supports the full 5-state lifecycle with SLEEP1 (weights offloaded to CPU RAM) and SLEEP2 (weights and KV cache released, CUDA context retained). `vllm_socket_dir` must be configured when at least one model uses the vLLM engine.
+
+### llama.cpp engine
+
+Uses the `llama-server` binary (must be on `$PATH`) to serve GGUF-format models. Configuration requires:
+
+- `llama_cpp_socket_dir`: separate Unix socket directory (must be writable)
+- `llama_cpp_model_dir`: base directory for model files
+- `gguf_path`: filename within `llama_cpp_model_dir` (resolved as `llama_cpp_model_dir/gguf_path`)
+- `llama_cpp_args`: optional raw passthrough flags appended to the `llama-server` command line (same pattern as `vllm_args`)
+
+The `vram_allocation` field is authoritative from launch — the orchestrator does not parse llama.cpp logs for memory measurements.
+
+**Lifecycle**: llama.cpp models have only two states, ACTIVE and UNLOADED. When idle for `ttl_unused`, the process is killed directly (no SLEEP1/SLEEP2 transitions). `ttl_active` and `ttl_inactive` are accepted in config for ordering-validation consistency but are semantically inert for llama.cpp models.
+
+**Optional `--sleep-idle-seconds`**: llama.cpp's native `--sleep-idle-seconds` flag can be passed via `llama_cpp_args` for an opaque, orchestrator-invisible sleep/wake cycle. Not recommended by default: open issue [#19379](https://github.com/ggml-org/llama.cpp/issues/19379) reports ~600 MB residual VRAM per GPU after sleep, so the orchestrator's own process kill via `ttl_unused` remains the primary VRAM-reclaim mechanism.
 
 ## API
 

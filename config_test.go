@@ -167,6 +167,137 @@ func TestValidateConfig(t *testing.T) {
 	}
 }
 
+func TestValidateConfigLlamaCpp(t *testing.T) {
+	t.Parallel()
+
+	llamaCppSocketDir := t.TempDir()
+	llamaCppModelDir := t.TempDir()
+	// Create a dummy GGUF file for the valid llama_cpp test cases.
+	ggufPath := filepath.Join(llamaCppModelDir, "test.gguf")
+	if err := os.WriteFile(ggufPath, []byte("dummy"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	goodLlamaCpp := func() *Config {
+		return &Config{
+			Listen:            ":8000",
+			LlamaCppSocketDir: llamaCppSocketDir,
+			LlamaCppModelDir:  llamaCppModelDir,
+			QueueDepth:        10,
+			TTLActive:         5 * time.Minute,
+			TTLInactive:       30 * time.Minute,
+			TTLUnused:         60 * time.Minute,
+			GPUGroups:         []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+			Models: []ModelConfig{
+				{Name: "m1", Engine: engineLlamaCpp, GGUFPath: "test.gguf"},
+			},
+		}
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{"valid llama_cpp", func(*Config) {}, ""},
+		{"llama_cpp missing socket_dir", func(c *Config) {
+			c.LlamaCppSocketDir = ""
+		}, "llama_cpp_socket_dir is required"},
+		{"llama_cpp missing model_dir", func(c *Config) {
+			c.LlamaCppModelDir = ""
+		}, "llama_cpp_model_dir is required"},
+		{"llama_cpp missing gguf_path", func(c *Config) {
+			c.Models[0].GGUFPath = ""
+		}, "gguf_path is required"},
+		{"llama_cpp gguf file not found", func(c *Config) {
+			c.Models[0].GGUFPath = "nonexistent.gguf"
+		}, "not found"},
+		{"llama_cpp kv_cache set", func(c *Config) {
+			c.Models[0].KVCacheMemoryGB = 5.0
+		}, "kv_cache_memory must not be set"},
+		{"llama_cpp vllm_args set", func(c *Config) {
+			c.Models[0].VLLMArgs = []string{"--foo"}
+		}, "vllm_args must not be set"},
+		{"vllm model with gguf_path", func(c *Config) {
+			c.Models[0].Engine = ""
+			c.Models[0].GGUFPath = "test.gguf"
+			c.VLLMSocketDir = t.TempDir()
+		}, "gguf_path must not be set"},
+		{"vllm model with llama_cpp_args", func(c *Config) {
+			c.Models[0].Engine = ""
+			c.Models[0].GGUFPath = ""
+			c.Models[0].LlamaCppArgs = []string{"-t", "8"}
+			c.VLLMSocketDir = t.TempDir()
+		}, "llama_cpp_args must not be set"},
+		{"bad engine value", func(c *Config) {
+			c.Models[0].Engine = "unknown_engine"
+		}, "must be empty"},
+		{"mixed vllm+llama_cpp both dirs required", func(c *Config) {
+			vdllamaGGuf := filepath.Join(llamaCppModelDir, "vddllama.gguf")
+			os.WriteFile(vdllamaGGuf, []byte("dummy"), 0644)
+			c.VLLMSocketDir = t.TempDir()
+			c.Models = append(c.Models, ModelConfig{
+				Name:     "m2",
+				Engine:   engineLlamaCpp,
+				GGUFPath: "vddllama.gguf",
+			})
+		}, ""},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := goodLlamaCpp()
+			tc.mutate(cfg)
+			err := validateConfig(cfg)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestConditionalVLLMSocketDir(t *testing.T) {
+	t.Parallel()
+
+	// All-llama_cpp config should NOT require vllm_socket_dir.
+	llamaCppSocketDir := t.TempDir()
+	llamaCppModelDir := t.TempDir()
+	ggufPath := filepath.Join(llamaCppModelDir, "test.gguf")
+	if err := os.WriteFile(ggufPath, []byte("dummy"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		Listen:            ":8000",
+		LlamaCppSocketDir: llamaCppSocketDir,
+		LlamaCppModelDir:  llamaCppModelDir,
+		QueueDepth:        10,
+		TTLActive:         5 * time.Minute,
+		TTLInactive:       30 * time.Minute,
+		TTLUnused:         60 * time.Minute,
+		GPUGroups:         []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models: []ModelConfig{
+			{Name: "m1", Engine: engineLlamaCpp, GGUFPath: "test.gguf"},
+		},
+	}
+	// VLLMSocketDir is empty — should pass since no vLLM models.
+	err := validateConfig(cfg)
+	if err != nil {
+		t.Fatalf("expected no error when no vLLM models and vllm_socket_dir is empty, got: %v", err)
+	}
+}
+
 func TestModelConfigKVCacheMemory(t *testing.T) {
 	t.Parallel()
 

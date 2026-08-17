@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -134,6 +135,86 @@ func buildEnv(cudaVisible string) []string {
 		"VLLM_USE_FASTOKENS=1",
 	)
 	return out
+}
+
+// launchLlamaCpp starts a llama-server subprocess for modelCfg on gpuGroup and
+// returns the process handle. VRAM accounting is set synchronously from
+// modelCfg.VRAMAllocationMB (no log parsing).
+func launchLlamaCpp(modelCfg ModelConfig, socketPath string, group *groupState, mem *modelMemory, modelDir string) (*vllmProcess, error) {
+	// Remove stale socket if present and unowned.
+	if _, err := os.Stat(socketPath); err == nil {
+		if err := checkSocketOwned(socketPath); err == nil {
+			return nil, fmt.Errorf("launch %q: socket %s is owned by a live process", modelCfg.Name, socketPath)
+		}
+		os.Remove(socketPath)
+	}
+
+	visibleDevs := make([]string, len(group.gpus))
+	for i, d := range group.gpus {
+		visibleDevs[i] = strconv.Itoa(d)
+	}
+	cudaVisible := strings.Join(visibleDevs, ",")
+
+	args := append([]string{
+		"-m", filepath.Join(modelDir, modelCfg.GGUFPath),
+		"--host", socketPath,
+		"-a", modelCfg.Name,
+	}, modelCfg.LlamaCppArgs...)
+
+	cmd := exec.Command("llama-server", args...)
+	cmd.Env = buildEnvLlamaCpp(cudaVisible)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("launch %q: stdout pipe: %w", modelCfg.Name, err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("launch %q: stderr pipe: %w", modelCfg.Name, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("launch %q: %w", modelCfg.Name, err)
+	}
+
+	// VRAM accounting: authoritative from config, no log parsing.
+	mem.fullKVVRAMMB = modelCfg.VRAMAllocationMB
+	mem.measured = true
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	vp := &vllmProcess{cmd: cmd, socketPath: socketPath, client: client, exited: make(chan struct{})}
+
+	go drainAndMeasure(stdout, modelCfg.Name, nil)
+	go drainAndMeasure(stderr, modelCfg.Name, nil)
+	go func() {
+		cmd.Wait()
+		close(vp.exited)
+	}()
+
+	return vp, nil
+}
+
+// buildEnvLlamaCpp constructs the subprocess environment with only CUDA
+// device visibility (no vLLM-specific tuning vars).
+func buildEnvLlamaCpp(cudaVisible string) []string {
+	base := os.Environ()
+	out := make([]string, 0, len(base)+2)
+	for _, kv := range base {
+		k := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			k = kv[:i]
+		}
+		if k == "CUDA_VISIBLE_DEVICES" || k == "CUDA_DEVICE_ORDER" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "CUDA_VISIBLE_DEVICES="+cudaVisible, "CUDA_DEVICE_ORDER=PCI_BUS_ID")
 }
 
 // drainAndMeasure reads r, logs each line tagged with modelName, and (when mem

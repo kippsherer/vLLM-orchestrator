@@ -3,22 +3,30 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	engineVLLM     = "vllm"
+	engineLlamaCpp = "llama_cpp"
+)
+
 // Config is the top-level structure parsed from the YAML config file.
 type Config struct {
-	Listen        string        `yaml:"listen"`
-	VLLMSocketDir string        `yaml:"vllm_socket_dir"`
-	QueueDepth    int           `yaml:"queue_depth"`
-	TTLActive     time.Duration `yaml:"ttl_active"`
-	TTLInactive   time.Duration `yaml:"ttl_inactive"`
-	TTLUnused     time.Duration `yaml:"ttl_unused"`
-	GPUGroups     []GPUGroup    `yaml:"gpu_groups"`
-	Models        []ModelConfig `yaml:"models"`
+	Listen            string        `yaml:"listen"`
+	VLLMSocketDir     string        `yaml:"vllm_socket_dir"`
+	LlamaCppSocketDir string        `yaml:"llama_cpp_socket_dir"`
+	LlamaCppModelDir  string        `yaml:"llama_cpp_model_dir"`
+	QueueDepth        int           `yaml:"queue_depth"`
+	TTLActive         time.Duration `yaml:"ttl_active"`
+	TTLInactive       time.Duration `yaml:"ttl_inactive"`
+	TTLUnused         time.Duration `yaml:"ttl_unused"`
+	GPUGroups         []GPUGroup    `yaml:"gpu_groups"`
+	Models            []ModelConfig `yaml:"models"`
 }
 
 // GPUGroup declares a set of CUDA device IDs that form a scheduling unit.
@@ -31,14 +39,17 @@ type GPUGroup struct {
 type ModelConfig struct {
 	Name             string        `yaml:"name"`
 	Aliases          []string      `yaml:"aliases"`
+	Engine           string        `yaml:"engine"` // "" or "vllm" (default) | "llama_cpp"
 	LoadAtStartup    bool          `yaml:"load_at_startup"`
 	GPUGroup         string        `yaml:"gpu_group"`       // when set, pins this model to the named gpu_group
-	VRAMAllocationMB int64         `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group; used to derive --gpu-memory-utilization
-	KVCacheMemoryGB  float64       `yaml:"kv_cache_memory"` // when set, passed as --kv-cache-memory-bytes (GiB, e.g. "10g") and skips --gpu-memory-utilization
+	VRAMAllocationMB int64         `yaml:"vram_allocation"` // authoritative VRAM this model is allowed to consume on the group
+	KVCacheMemoryGB  float64       `yaml:"kv_cache_memory"` // vLLM only; passed as --kv-cache-memory-bytes (GiB)
 	TTLActive        time.Duration `yaml:"ttl_active"`      // overrides global ttl_active when > 0
 	TTLInactive      time.Duration `yaml:"ttl_inactive"`    // overrides global ttl_inactive when > 0
 	TTLUnused        time.Duration `yaml:"ttl_unused"`      // overrides global ttl_unused when > 0
-	VLLMArgs         []string      `yaml:"vllm_args"`
+	VLLMArgs         []string      `yaml:"vllm_args"`       // vLLM only
+	GGUFPath         string        `yaml:"gguf_path"`       // llama_cpp only; joined with llama_cpp_model_dir
+	LlamaCppArgs     []string      `yaml:"llama_cpp_args"`  // llama_cpp only; raw passthrough
 }
 
 // loadConfig reads and parses the YAML file at path.
@@ -60,9 +71,6 @@ func loadConfig(path string) (*Config, error) {
 func validateConfig(cfg *Config) error {
 	if cfg.Listen == "" {
 		return fmt.Errorf("config: listen is required")
-	}
-	if cfg.VLLMSocketDir == "" {
-		return fmt.Errorf("config: vllm_socket_dir is required")
 	}
 	if cfg.QueueDepth <= 0 {
 		return fmt.Errorf("config: queue_depth must be > 0")
@@ -106,12 +114,14 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
-	// Duplicate model names or aliases.
+	// Duplicate model names or aliases per-model validation.
 	groupIDs := make(map[string]struct{})
 	for _, g := range cfg.GPUGroups {
 		groupIDs[g.ID] = struct{}{}
 	}
 	names := make(map[string]struct{})
+	hasVLLM := false
+	hasLlamaCpp := false
 	for _, m := range cfg.Models {
 		if m.Name == "" {
 			return fmt.Errorf("config: model entry missing name")
@@ -132,6 +142,15 @@ func validateConfig(cfg *Config) error {
 				return fmt.Errorf("config: model %q: gpu_group %q not found in gpu_groups", m.Name, m.GPUGroup)
 			}
 		}
+		// Engine validation.
+		switch m.Engine {
+		case "", engineVLLM:
+			hasVLLM = true
+		case engineLlamaCpp:
+			hasLlamaCpp = true
+		default:
+			return fmt.Errorf("config: model %q: engine must be empty, %q, or %q; got %q", m.Name, engineVLLM, engineLlamaCpp, m.Engine)
+		}
 		// Per-model TTL overrides must be self-consistent when set.
 		eff := func(modelVal, globalVal time.Duration) time.Duration {
 			if modelVal > 0 {
@@ -148,18 +167,73 @@ func validateConfig(cfg *Config) error {
 		if effInactive >= effUnused {
 			return fmt.Errorf("config: model %q: effective ttl_inactive (%v) must be < ttl_unused (%v)", m.Name, effInactive, effUnused)
 		}
+		// Engine-specific field validation.
+		if m.Engine == engineLlamaCpp {
+			if m.GGUFPath == "" {
+				return fmt.Errorf("config: model %q: gguf_path is required for llama_cpp engine", m.Name)
+			}
+			if m.KVCacheMemoryGB != 0 {
+				return fmt.Errorf("config: model %q: kv_cache_memory must not be set for llama_cpp engine", m.Name)
+			}
+			if len(m.VLLMArgs) > 0 {
+				return fmt.Errorf("config: model %q: vllm_args must not be set for llama_cpp engine", m.Name)
+			}
+		} else {
+			if m.GGUFPath != "" {
+				return fmt.Errorf("config: model %q: gguf_path must not be set for vllm engine", m.Name)
+			}
+			if len(m.LlamaCppArgs) > 0 {
+				return fmt.Errorf("config: model %q: llama_cpp_args must not be set for vllm engine", m.Name)
+			}
+		}
 	}
 
-	// vllm_socket_dir writable check.
-	if err := os.MkdirAll(cfg.VLLMSocketDir, 0700); err != nil {
-		return fmt.Errorf("config: vllm_socket_dir %q not writable: %w", cfg.VLLMSocketDir, err)
+	// Conditional socket dir requirements.
+	if hasVLLM {
+		if cfg.VLLMSocketDir == "" {
+			return fmt.Errorf("config: vllm_socket_dir is required when models use vllm engine")
+		}
+		if err := os.MkdirAll(cfg.VLLMSocketDir, 0700); err != nil {
+			return fmt.Errorf("config: vllm_socket_dir %q not writable: %w", cfg.VLLMSocketDir, err)
+		}
+		f, err := os.CreateTemp(cfg.VLLMSocketDir, ".writetest")
+		if err != nil {
+			return fmt.Errorf("config: vllm_socket_dir %q not writable: %w", cfg.VLLMSocketDir, err)
+		}
+		f.Close()
+		os.Remove(f.Name())
 	}
-	f, err := os.CreateTemp(cfg.VLLMSocketDir, ".writetest")
-	if err != nil {
-		return fmt.Errorf("config: vllm_socket_dir %q not writable: %w", cfg.VLLMSocketDir, err)
+	if hasLlamaCpp {
+		if cfg.LlamaCppSocketDir == "" {
+			return fmt.Errorf("config: llama_cpp_socket_dir is required when models use llama_cpp engine")
+		}
+		if cfg.LlamaCppModelDir == "" {
+			return fmt.Errorf("config: llama_cpp_model_dir is required when models use llama_cpp engine")
+		}
+		if err := os.MkdirAll(cfg.LlamaCppSocketDir, 0700); err != nil {
+			return fmt.Errorf("config: llama_cpp_socket_dir %q not writable: %w", cfg.LlamaCppSocketDir, err)
+		}
+		f, err := os.CreateTemp(cfg.LlamaCppSocketDir, ".writetest")
+		if err != nil {
+			return fmt.Errorf("config: llama_cpp_socket_dir %q not writable: %w", cfg.LlamaCppSocketDir, err)
+		}
+		f.Close()
+		os.Remove(f.Name())
 	}
-	f.Close()
-	os.Remove(f.Name())
+
+	// File existence check for llama_cpp models (after socket dir checks ensure dirs are set).
+	for _, m := range cfg.Models {
+		if m.Engine == engineLlamaCpp {
+			fullPath := filepath.Join(cfg.LlamaCppModelDir, m.GGUFPath)
+			info, err := os.Stat(fullPath)
+			if err != nil {
+				return fmt.Errorf("config: model %q: GGUF file %s not found: %w", m.Name, fullPath, err)
+			}
+			if info.IsDir() {
+				return fmt.Errorf("config: model %q: GGUF path %s is a directory, not a file", m.Name, fullPath)
+			}
+		}
+	}
 
 	return nil
 }

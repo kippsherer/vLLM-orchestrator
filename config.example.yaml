@@ -1,5 +1,7 @@
 listen: ":8000"
 vllm_socket_dir: "/run/vllm"
+llama_cpp_socket_dir: "/run/llama"
+llama_cpp_model_dir: "/data/llama/models"
 queue_depth: 100
 
 ttl_active: 10m
@@ -9,7 +11,7 @@ ttl_unused: 120m
 gpu_groups:
   - id: "group0"
     gpus: [0, 1, 2, 3]       # CUDA device IDs in this group
-                               # Total VRAM is measured from nvidia-smi at startup
+                                # Total VRAM is measured from nvidia-smi at startup
 
   - id: "group1"
     gpus: [4]                  # Single-GPU group example
@@ -51,3 +53,18 @@ models:
     vllm_args:
       - "--dtype=float16"
       - "--max-model-len=4096"
+
+  # llama.cpp (GGUF) model example
+  - name: "unsloth/Qwen3.6-27B-MTP-GGUF"
+    aliases: ["qwen3.6-27b-gguf"]
+    engine: llama_cpp
+    gguf_path: "Qwen3.6-27B-MTP-Q4_K_M.gguf"   # resolved as /data/llama/models/Qwen3.6-27B-MTP-Q4_K_M.gguf
+    vram_allocation: 22000                       # MB; authoritative, no runtime measurement
+    ttl_unused: 60m                              # sole idle-to-kill timer for this model
+    llama_cpp_args:
+      - "-ngl"
+      - "auto"      # or an explicit layer count, or "all"/"0" for full-GPU/full-CPU
+      - "-t"
+      - "16"
+      - "-fa"
+      - "on"

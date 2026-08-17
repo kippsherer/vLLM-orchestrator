@@ -79,9 +79,13 @@ func newOrchestrator(cfg *Config, ms *memoryState) *orchestrator {
 		modelByName: make(map[string]*modelEntry),
 	}
 	for _, mc := range cfg.Models {
+		socketDir := cfg.VLLMSocketDir
+		if mc.Engine == engineLlamaCpp {
+			socketDir = cfg.LlamaCppSocketDir
+		}
 		me := &modelEntry{
 			cfg:              mc,
-			socketPath:       cfg.VLLMSocketDir + "/" + sanitizeModelName(mc.Name) + ".sock",
+			socketPath:       socketDir + "/" + sanitizeModelName(mc.Name) + ".sock",
 			state:            stateUnloaded,
 			queue:            make(chan requestPair, cfg.QueueDepth),
 			lastCompleted:    time.Now(),
@@ -139,6 +143,20 @@ func (o *orchestrator) tickTTL(me *modelEntry) {
 
 	switch state {
 	case stateActive:
+		if me.cfg.Engine == engineLlamaCpp {
+			if activeReqs > 0 || idle < ttlUnused {
+				return
+			}
+			me.mu.Lock()
+			if me.state != stateActive || me.activeRequests > 0 {
+				me.mu.Unlock()
+				return
+			}
+			proc := me.proc
+			me.mu.Unlock()
+			o.killAndUnload(me, proc, "ttl_unused elapsed")
+			return
+		}
 		if activeReqs > 0 || idle < ttlActive {
 			return
 		}
@@ -186,19 +204,25 @@ func (o *orchestrator) tickTTL(me *modelEntry) {
 			return
 		}
 		proc := me.proc
-		groupIdx := me.assignedGroupIdx
-		me.state = stateUnloaded
-		me.proc = nil
-		me.assignedGroupIdx = -1
-		me.reservedVRAMMB = 0
 		me.mu.Unlock()
-
-		if proc != nil {
-			killProcess(proc, me.cfg.Name)
-		}
-		log.Printf("[orchestrator] %s: SLEEP2 → UNLOADED (ttl_unused elapsed)", me.cfg.Name)
-		_ = groupIdx // SLEEP2 holds no VRAM in accounting
+		o.killAndUnload(me, proc, "ttl_unused elapsed")
 	}
+}
+
+// killAndUnload terminates proc and marks me UNLOADED. Must be called without me.mu held.
+func (o *orchestrator) killAndUnload(me *modelEntry, proc *vllmProcess, reason string) {
+	me.mu.Lock()
+	if me.proc != proc {
+		me.mu.Unlock()
+		return
+	}
+	me.state = stateUnloaded
+	me.proc = nil
+	me.assignedGroupIdx = -1
+	me.reservedVRAMMB = 0
+	me.mu.Unlock()
+	killProcess(proc, me.cfg.Name)
+	log.Printf("[orchestrator] %s: → UNLOADED (%s)", me.cfg.Name, reason)
 }
 
 // transitionToSleep calls /sleep?level on the vLLM process, updates accounting,
@@ -340,7 +364,12 @@ func (o *orchestrator) handleRequest(me *modelEntry, rp requestPair) {
 			return
 		}
 
-		proc, err := launchVLLM(me.cfg, me.socketPath, o.ms.groups[groupIdx], &me.mem)
+		var proc *vllmProcess
+		if me.cfg.Engine == engineLlamaCpp {
+			proc, err = launchLlamaCpp(me.cfg, me.socketPath, o.ms.groups[groupIdx], &me.mem, o.cfg.LlamaCppModelDir)
+		} else {
+			proc, err = launchVLLM(me.cfg, me.socketPath, o.ms.groups[groupIdx], &me.mem)
+		}
 		if err != nil {
 			log.Printf("[orchestrator] %s: launch failed: %v", me.cfg.Name, err)
 			me.mu.Lock()

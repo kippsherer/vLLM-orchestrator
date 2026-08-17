@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -642,4 +643,124 @@ func TestWakeAndActivate(t *testing.T) {
 			t.Errorf("freeCPURAMB = %d, want %d (unchanged)", o.ms.freeCPURAMB, cpuBefore)
 		}
 	})
+}
+
+func TestRule1LlamaCppEviction(t *testing.T) {
+	t.Parallel()
+
+	llamaCppDir := t.TempDir()
+	cfg := &Config{
+		Listen:            ":9999",
+		LlamaCppSocketDir: llamaCppDir,
+		QueueDepth:        4,
+		TTLActive:         5 * time.Minute,
+		TTLInactive:       30 * time.Minute,
+		TTLUnused:         60 * time.Minute,
+		GPUGroups:         []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models: []ModelConfig{
+			{Name: "llama-dest-model", Engine: engineLlamaCpp},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: 10000},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+	me := o.models[0]
+
+	// Set model to ACTIVE with zero active requests and assigned to group 0.
+	me.mu.Lock()
+	me.state = stateActive
+	me.activeRequests = 0
+	me.assignedGroupIdx = 0
+	me.reservedVRAMMB = 15000
+	me.mem.fullKVVRAMMB = 15000
+	me.proc = &vllmProcess{cmd: &exec.Cmd{}, socketPath: llamaCppDir + "/dummy.sock"}
+	me.mu.Unlock()
+
+	// Mock nvidia-smi to return freed VRAM (10000 + 15000 = 25000) after eviction.
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() {
+		queryNvidiaSmiFreeMB = origSmi
+		readMemAvailableMB = origMem
+	})
+	queryNvidiaSmiFreeMB = func() (string, error) { return "0, 25000", nil }
+	readMemAvailableMB = func() (int64, error) { return 65536, nil }
+
+	// Call freeMemoryRules — it should evict the llama_cpp model (activeReqs==0).
+	result := o.freeMemoryRules(ms.groups[0], 12000)
+
+	if !result {
+		t.Error("expected freeMemoryRules to succeed after evicting llama_cpp model")
+	}
+
+	me.mu.Lock()
+	st := me.state
+	p := me.proc
+	me.mu.Unlock()
+
+	if st != stateUnloaded {
+		t.Errorf("state = %s, want unloaded after Rule 1 llama_cpp eviction", st)
+	}
+	if p != nil {
+		t.Error("proc should be nil after eviction via killAndUnload")
+	}
+}
+
+func TestRule1LlamaCppSkippedWithActiveReqs(t *testing.T) {
+	t.Parallel()
+
+	llamaCppDir := t.TempDir()
+	cfg := &Config{
+		Listen:            ":9999",
+		LlamaCppSocketDir: llamaCppDir,
+		QueueDepth:        4,
+		TTLActive:         5 * time.Minute,
+		TTLInactive:       30 * time.Minute,
+		TTLUnused:         60 * time.Minute,
+		GPUGroups:         []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models: []ModelConfig{
+			{Name: "llama-dest-model", Engine: engineLlamaCpp},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: 5000},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+	me := o.models[0]
+
+	// Set model to ACTIVE with activeRequests > 0 — should NOT be evicted.
+	me.mu.Lock()
+	me.state = stateActive
+	me.activeRequests = 3
+	me.assignedGroupIdx = 0
+	me.reservedVRAMMB = 15000
+	me.mem.fullKVVRAMMB = 15000
+	me.proc = &vllmProcess{cmd: &exec.Cmd{}, socketPath: llamaCppDir + "/dummy.sock"}
+	me.mu.Unlock()
+
+	// freeMemoryRules should skip this llama_cpp model because activeReqs > 0.
+	result := o.freeMemoryRules(ms.groups[0], 12000)
+
+	if result {
+		t.Error("expected freeMemoryRules to fail: llama_cpp model with active requests should be skipped")
+	}
+
+	me.mu.Lock()
+	st := me.state
+	p := me.proc
+	me.mu.Unlock()
+
+	if st != stateActive {
+		t.Errorf("state = %s, want active (should NOT be evicted with active requests)", st)
+	}
+	if p == nil {
+		t.Error("proc should not be nil (model was not evicted)")
+	}
 }

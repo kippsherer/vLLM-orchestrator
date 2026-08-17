@@ -45,13 +45,19 @@ func main() {
 	refreshMemory(ms)
 
 	// Remove stale socket files from a prior crash.
-	entries, err := os.ReadDir(cfg.VLLMSocketDir)
-	if err == nil {
+	for _, dir := range []string{cfg.VLLMSocketDir, cfg.LlamaCppSocketDir} {
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
 		for _, e := range entries {
 			if !strings.HasSuffix(e.Name(), ".sock") {
 				continue
 			}
-			path := filepath.Join(cfg.VLLMSocketDir, e.Name())
+			path := filepath.Join(dir, e.Name())
 			if checkSocketOwned(path) != nil {
 				os.Remove(path)
 				log.Printf("startup: removed stale socket %s", path)

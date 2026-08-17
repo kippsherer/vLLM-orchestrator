@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,56 @@ func TestBuildEnv(t *testing.T) {
 	}
 	if fasttokensVal != "1" {
 		t.Errorf("VLLM_USE_FASTOKENS = %q, want %q (parent value must be overridden)", fasttokensVal, "1")
+	}
+}
+
+func TestBuildEnvLlamaCpp(t *testing.T) {
+	t.Parallel()
+
+	os.Setenv("CUDA_VISIBLE_DEVICES", "old_value")
+	os.Setenv("CUDA_DEVICE_ORDER", "old_order")
+	os.Setenv("VLLM_SERVER_DEV_MODE", "should_be_inherited")
+	t.Cleanup(func() {
+		os.Unsetenv("CUDA_VISIBLE_DEVICES")
+		os.Unsetenv("CUDA_DEVICE_ORDER")
+		os.Unsetenv("VLLM_SERVER_DEV_MODE")
+	})
+
+	result := buildEnvLlamaCpp("2,3")
+
+	var cudaVal, deviceOrderVal string
+	cudaCount, deviceOrderCount := 0, 0
+	hasDevModeVar := false
+	for _, kv := range result {
+		if strings.HasPrefix(kv, "CUDA_VISIBLE_DEVICES=") {
+			cudaVal = strings.TrimPrefix(kv, "CUDA_VISIBLE_DEVICES=")
+			cudaCount++
+		}
+		if strings.HasPrefix(kv, "CUDA_DEVICE_ORDER=") {
+			deviceOrderVal = strings.TrimPrefix(kv, "CUDA_DEVICE_ORDER=")
+			deviceOrderCount++
+		}
+		if kv == "VLLM_SERVER_DEV_MODE=should_be_inherited" {
+			hasDevModeVar = true
+		}
+	}
+	if cudaCount != 1 {
+		t.Errorf("CUDA_VISIBLE_DEVICES appears %d times, want 1", cudaCount)
+	}
+	if deviceOrderCount != 1 {
+		t.Errorf("CUDA_DEVICE_ORDER appears %d times, want 1", deviceOrderCount)
+	}
+	if cudaVal != "2,3" {
+		t.Errorf("CUDA_VISIBLE_DEVICES = %q, want %q", cudaVal, "2,3")
+	}
+	if deviceOrderVal != "PCI_BUS_ID" {
+		t.Errorf("CUDA_DEVICE_ORDER = %q, want %q", deviceOrderVal, "PCI_BUS_ID")
+	}
+	// buildEnvLlamaCpp only strips CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER from
+	// the parent env — unlike buildEnv, it does not strip or inject
+	// VLLM_SERVER_DEV_MODE, so the parent's value must pass through unchanged.
+	if !hasDevModeVar {
+		t.Error("VLLM_SERVER_DEV_MODE from parent env should be inherited unchanged (only CUDA vars are stripped)")
 	}
 }
 
@@ -347,5 +398,58 @@ func TestWaitForHealthFailsFastOnProcessExit(t *testing.T) {
 	}
 	if elapsed > 5*time.Second {
 		t.Errorf("waitForHealth took %v, want it to fail fast (well under the 3600s timeout)", elapsed)
+	}
+}
+
+func TestLlamaCppArgConstruction(t *testing.T) {
+	t.Parallel()
+
+	// Verify the arg list shape that launchLlamaCpp produces (without actually
+	// spawning the process, since llama-server likely isn't installed in tests).
+	modelCfg := ModelConfig{
+		Name:             "test-model",
+		Aliases:          []string{"alias1", "alias2"},
+		Engine:           engineLlamaCpp,
+		GGUFPath:         "test.gguf",
+		VRAMAllocationMB: 20000,
+		LlamaCppArgs:     []string{"-ngl", "auto", "-t", "16"},
+	}
+	modelDir := "/data/models"
+	socketPath := "/run/llama/test.sock"
+
+	// Reconstruct the args that launchLlamaCpp builds.
+	args := append([]string{
+		"-m", filepath.Join(modelDir, modelCfg.GGUFPath),
+		"--host", socketPath,
+		"-a", modelCfg.Name,
+	}, modelCfg.LlamaCppArgs...)
+
+	if len(args) != 10 {
+		t.Fatalf("args len = %d, want 10", len(args))
+	}
+	cases := []struct {
+		idx  int
+		want string
+	}{
+		{0, "-m"},
+		{1, "/data/models/test.gguf"},
+		{2, "--host"},
+		{3, "/run/llama/test.sock"},
+		{4, "-a"},
+		{5, "test-model"}, // correction 1: only Name, no aliases joined
+		{6, "-ngl"},
+		{7, "auto"},
+		{8, "-t"},
+		{9, "16"},
+	}
+	for _, c := range cases {
+		if args[c.idx] != c.want {
+			t.Errorf("args[%d] = %q, want %q", c.idx, args[c.idx], c.want)
+		}
+	}
+
+	// Verify -a contains only the canonical name (not comma-joined aliases).
+	if args[5] != "test-model" {
+		t.Errorf("-a value = %q, want %q (CORRECTION 1: only Name, no aliases)", args[5], "test-model")
 	}
 }

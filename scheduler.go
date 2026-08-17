@@ -170,6 +170,30 @@ func (o *orchestrator) freeMemoryRules(gs *groupState, neededMB int64) bool {
 			me.mu.Unlock()
 			continue
 		}
+		if me.cfg.Engine == engineLlamaCpp {
+			if me.activeRequests > 0 {
+				me.mu.Unlock()
+				continue
+			}
+			proc := me.proc
+			expectedMB := me.reservedVRAMMB
+			me.mu.Unlock()
+
+			o.ms.mu.RLock()
+			freeBefore := gs.measuredFreeMB
+			o.ms.mu.RUnlock()
+
+			o.killAndUnload(me, proc, "evicted to free VRAM")
+			waitVRAMStable(o.ms, gs, freeBefore, expectedMB)
+			o.ms.mu.RLock()
+			free := gs.measuredFreeMB
+			o.ms.mu.RUnlock()
+			log.Printf("[scheduler] rule1: free %dMB → %dMB (needed %dMB)  %s  ACTIVE → UNLOADED (llama_cpp)", freeBefore, free, neededMB, me.cfg.Name)
+			if free >= neededMB {
+				return true
+			}
+			continue
+		}
 		weightsVRAM := me.mem.weightsVRAMMB
 		proc := me.proc
 		me.mu.Unlock()

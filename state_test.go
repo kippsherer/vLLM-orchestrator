@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,6 +54,49 @@ func TestNewOrchestrator(t *testing.T) {
 		if len(me.socketPath) == 0 {
 			t.Errorf("model %q has empty socketPath", me.cfg.Name)
 		}
+	}
+}
+
+func TestNewOrchestratorLlamaCppSocketDir(t *testing.T) {
+	t.Parallel()
+	vllmDir := t.TempDir()
+	llamaCppDir := t.TempDir()
+	cfg := &Config{
+		Listen:            ":9999",
+		VLLMSocketDir:     vllmDir,
+		LlamaCppSocketDir: llamaCppDir,
+		QueueDepth:        4,
+		TTLActive:         5 * time.Minute,
+		TTLInactive:       30 * time.Minute,
+		TTLUnused:         60 * time.Minute,
+		GPUGroups:         []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models: []ModelConfig{
+			{Name: "vllm-model", Engine: "vllm"},
+			{Name: "llama-model", Engine: engineLlamaCpp},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: -1},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+
+	if len(o.models) != 2 {
+		t.Fatalf("got %d models, want 2", len(o.models))
+	}
+
+	// vLLM model socket should be in VLLMSocketDir.
+	vllmMe := o.resolve("vllm-model")
+	if !strings.HasPrefix(vllmMe.socketPath, vllmDir) {
+		t.Errorf("vLLM model socketPath = %q, want prefix %q", vllmMe.socketPath, vllmDir)
+	}
+
+	// llama_cpp model socket should be in LlamaCppSocketDir.
+	llamaMe := o.resolve("llama-model")
+	if !strings.HasPrefix(llamaMe.socketPath, llamaCppDir) {
+		t.Errorf("llama_cpp model socketPath = %q, want prefix %q", llamaMe.socketPath, llamaCppDir)
 	}
 }
 
@@ -416,5 +461,99 @@ func TestTickTTLNotExpired(t *testing.T) {
 	me.mu.Unlock()
 	if st != stateActive {
 		t.Errorf("state = %s, want active", st)
+	}
+}
+
+func TestTickTTLActiveLlamaCpp(t *testing.T) {
+	t.Parallel()
+	llamaCppDir := t.TempDir()
+	cfg := &Config{
+		Listen:            ":9999",
+		LlamaCppSocketDir: llamaCppDir,
+		QueueDepth:        4,
+		TTLActive:         5 * time.Minute,
+		TTLInactive:       30 * time.Minute,
+		TTLUnused:         1 * time.Minute, // short TTL for testing
+		GPUGroups:         []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models: []ModelConfig{
+			{Name: "llama-model", Engine: engineLlamaCpp},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: -1},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+	me := o.models[0]
+
+	me.mu.Lock()
+	me.state = stateActive
+	me.activeRequests = 0
+	me.lastCompleted = time.Now().Add(-2 * time.Minute) // expired beyond ttl_unused
+	me.proc = &vllmProcess{cmd: &exec.Cmd{}, socketPath: llamaCppDir + "/dummy.sock"}
+	me.mu.Unlock()
+
+	o.tickTTL(me)
+
+	me.mu.Lock()
+	st := me.state
+	p := me.proc
+	gi := me.assignedGroupIdx
+	vram := me.reservedVRAMMB
+	me.mu.Unlock()
+
+	if st != stateUnloaded {
+		t.Errorf("state = %s, want unloaded (llama_cpp goes ACTIVE→UNLOADED)", st)
+	}
+	if p != nil {
+		t.Error("proc should be nil after unloading")
+	}
+	if gi != -1 {
+		t.Errorf("assignedGroupIdx = %d, want -1", gi)
+	}
+	if vram != 0 {
+		t.Errorf("reservedVRAMMB = %d, want 0", vram)
+	}
+}
+
+func TestTickTTLActiveLlamaCppNotExpired(t *testing.T) {
+	t.Parallel()
+	llamaCppDir := t.TempDir()
+	cfg := &Config{
+		Listen:            ":9999",
+		LlamaCppSocketDir: llamaCppDir,
+		QueueDepth:        4,
+		TTLActive:         5 * time.Minute,
+		TTLInactive:       30 * time.Minute,
+		TTLUnused:         60 * time.Minute,
+		GPUGroups:         []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models: []ModelConfig{
+			{Name: "llama-model", Engine: engineLlamaCpp},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: -1},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+	me := o.models[0]
+
+	me.mu.Lock()
+	me.state = stateActive
+	me.activeRequests = 0
+	me.lastCompleted = time.Now() // not expired
+	me.mu.Unlock()
+
+	o.tickTTL(me)
+
+	me.mu.Lock()
+	st := me.state
+	me.mu.Unlock()
+	if st != stateActive {
+		t.Errorf("state = %s, want active (not expired)", st)
 	}
 }
