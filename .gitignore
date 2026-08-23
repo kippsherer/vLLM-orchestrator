@@ -36,6 +36,9 @@ config.yaml
 # Agent instructions
 AGENTS.md
 
+# Orchestrator binary
+vLLM-orchestrator
+
 # Local deploy/environment details (host paths, service names)
 documents/environments.md
 
