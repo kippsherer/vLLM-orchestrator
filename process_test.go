@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -24,18 +26,20 @@ func TestBuildEnv(t *testing.T) {
 	os.Setenv("OMP_NUM_THREADS", "36")
 	os.Setenv("LD_PRELOAD", "/old/lib.so")
 	os.Setenv("VLLM_USE_FASTOKENS", "0")
+	os.Setenv("PYTORCH_CUDA_ALLOC_CONF", "native")
 	t.Cleanup(func() {
 		os.Unsetenv("CUDA_VISIBLE_DEVICES")
 		os.Unsetenv("VLLM_SERVER_DEV_MODE")
 		os.Unsetenv("OMP_NUM_THREADS")
 		os.Unsetenv("LD_PRELOAD")
 		os.Unsetenv("VLLM_USE_FASTOKENS")
+		os.Unsetenv("PYTORCH_CUDA_ALLOC_CONF")
 	})
 
 	result := buildEnv("0,1")
 
-	var cudaVal, devModeVal, ompVal, ldPreloadVal, fasttokensVal string
-	cudaCount, devModeCount, ompCount, ldPreloadCount, fasttokensCount := 0, 0, 0, 0, 0
+	var cudaVal, devModeVal, ompVal, ldPreloadVal, fasttokensVal, allocConfVal string
+	cudaCount, devModeCount, ompCount, ldPreloadCount, fasttokensCount, allocConfCount := 0, 0, 0, 0, 0, 0
 	for _, kv := range result {
 		if strings.HasPrefix(kv, "CUDA_VISIBLE_DEVICES=") {
 			cudaVal = strings.TrimPrefix(kv, "CUDA_VISIBLE_DEVICES=")
@@ -57,6 +61,10 @@ func TestBuildEnv(t *testing.T) {
 			fasttokensVal = strings.TrimPrefix(kv, "VLLM_USE_FASTOKENS=")
 			fasttokensCount++
 		}
+		if strings.HasPrefix(kv, "PYTORCH_CUDA_ALLOC_CONF=") {
+			allocConfVal = strings.TrimPrefix(kv, "PYTORCH_CUDA_ALLOC_CONF=")
+			allocConfCount++
+		}
 	}
 	if cudaCount != 1 {
 		t.Errorf("CUDA_VISIBLE_DEVICES appears %d times, want 1", cudaCount)
@@ -73,6 +81,9 @@ func TestBuildEnv(t *testing.T) {
 	if fasttokensCount != 1 {
 		t.Errorf("VLLM_USE_FASTOKENS appears %d times, want 1", fasttokensCount)
 	}
+	if allocConfCount != 1 {
+		t.Errorf("PYTORCH_CUDA_ALLOC_CONF appears %d times, want 1", allocConfCount)
+	}
 	if cudaVal != "0,1" {
 		t.Errorf("CUDA_VISIBLE_DEVICES = %q, want %q", cudaVal, "0,1")
 	}
@@ -87,6 +98,9 @@ func TestBuildEnv(t *testing.T) {
 	}
 	if fasttokensVal != "1" {
 		t.Errorf("VLLM_USE_FASTOKENS = %q, want %q (parent value must be overridden)", fasttokensVal, "1")
+	}
+	if allocConfVal != "expandable_segments:True" {
+		t.Errorf("PYTORCH_CUDA_ALLOC_CONF = %q, want %q (parent value must be overridden)", allocConfVal, "expandable_segments:True")
 	}
 }
 
@@ -185,6 +199,41 @@ func TestDrainAndMeasure(t *testing.T) {
 
 		if mem.measured {
 			t.Error("expected measured=false when no measurement lines present")
+		}
+	})
+
+	// Not parallel: swaps the global log output.
+	t.Run("raw_traceback_forwarded", func(t *testing.T) {
+		var buf bytes.Buffer
+		log.SetOutput(&buf)
+		t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+		pr, pw := io.Pipe()
+		mem := &modelMemory{}
+		done := make(chan struct{})
+		go func() {
+			drainAndMeasure(pr, "test-model", mem)
+			close(done)
+		}()
+		pw.Write([]byte("Traceback (most recent call last):\n"))
+		pw.Write([]byte("  File \"api_server.py\", line 598, in setup_server\n"))
+		pw.Write([]byte("OSError: [Errno 98] Address already in use\n"))
+		pw.Write([]byte("\n"))
+		pw.Write([]byte("INFO after traceback should stay hidden\n"))
+		pw.Close()
+		<-done
+
+		out := buf.String()
+		for _, want := range []string{"Traceback (most recent call last)", "OSError: [Errno 98]", "Address already in use"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("log output missing %q; got: %q", want, out)
+			}
+		}
+		if strings.Contains(out, "should stay hidden") {
+			t.Errorf("post-traceback line leaked to log: %q", out)
+		}
+		if mem.measured {
+			t.Error("expected measured=false")
 		}
 	})
 }
