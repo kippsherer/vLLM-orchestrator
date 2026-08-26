@@ -124,15 +124,19 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 // models (Qwen, DeepSeek, etc.), reducing tokenization overhead. Disable for
 // models with WordLevel tokenizers (e.g. surya-ocr-2) that the Rust backend
 // doesn't support.
+// PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True lets the CUDA allocator
+// grow segments contiguously instead of carving fixed blocks, reducing
+// reserved-but-unallocated fragmentation from variable-shape multimodal
+// activation spikes (vision-encoder forwards).
 func buildEnv(cudaVisible string, disableFastokens bool) []string {
 	base := os.Environ()
-	out := make([]string, 0, len(base)+7)
+	out := make([]string, 0, len(base)+8)
 	for _, kv := range base {
 		k := kv
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			k = kv[:i]
 		}
-		if k == "CUDA_VISIBLE_DEVICES" || k == "CUDA_DEVICE_ORDER" || k == "VLLM_SERVER_DEV_MODE" || k == "OMP_NUM_THREADS" || k == "VLLM_CPU_OMP_THREADS_BIND" || k == "LD_PRELOAD" || k == "VLLM_USE_FASTOKENS" {
+		if k == "CUDA_VISIBLE_DEVICES" || k == "CUDA_DEVICE_ORDER" || k == "VLLM_SERVER_DEV_MODE" || k == "OMP_NUM_THREADS" || k == "VLLM_CPU_OMP_THREADS_BIND" || k == "LD_PRELOAD" || k == "VLLM_USE_FASTOKENS" || k == "PYTORCH_CUDA_ALLOC_CONF" {
 			continue
 		}
 		out = append(out, kv)
@@ -144,6 +148,7 @@ func buildEnv(cudaVisible string, disableFastokens bool) []string {
 		"OMP_NUM_THREADS=8",
 		"VLLM_CPU_OMP_THREADS_BIND=auto",
 		"LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
+		"PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
 	)
 	if !disableFastokens {
 		out = append(out, "VLLM_USE_FASTOKENS=1")
@@ -233,14 +238,28 @@ func buildEnvLlamaCpp(cudaVisible string) []string {
 
 // drainAndMeasure reads r, logs each line tagged with modelName, and (when mem
 // is non-nil) parses memory measurement lines into mem. Drains to EOF always.
+// Forwarded lines: throughput stats, logger-prefixed WARNING/ERROR lines, and
+// raw Python tracebacks (which carry no logger prefix and would otherwise be
+// dropped silently — e.g. pre-logging crashes like UDS bind failures).
 func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory) {
 	warnDeadline := time.Now().Add(3600 * time.Second)
 	warnFired := false
+	inTraceback := false
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
-		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") {
+		isTracebackStart := strings.Contains(line, "Traceback (most recent call last)")
+		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") || isTracebackStart {
 			log.Printf("[vllm/%s] %s", modelName, line)
+			if isTracebackStart {
+				inTraceback = true
+			}
+		} else if inTraceback {
+			if strings.TrimSpace(line) == "" {
+				inTraceback = false
+			} else {
+				log.Printf("[vllm/%s] %s", modelName, line)
+			}
 		} else {
 			if verbose {
 				log.Printf("[vllm/%s] %s", modelName, line)
