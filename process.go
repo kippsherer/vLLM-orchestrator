@@ -73,7 +73,7 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 	}, memArg...), modelCfg.VLLMArgs...)
 
 	cmd := exec.Command("vllm", args...)
-	cmd.Env = buildEnv(cudaVisible)
+	cmd.Env = buildEnv(cudaVisible, modelCfg.DisableFastokens)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -113,7 +113,7 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 // buildEnv constructs the subprocess environment from the current env,
 // injecting CUDA_VISIBLE_DEVICES, VLLM_SERVER_DEV_MODE=1, OMP_NUM_THREADS=8,
 // VLLM_CPU_OMP_THREADS_BIND=auto, LD_PRELOAD=libtcmalloc_minimal, and
-// VLLM_USE_FASTOKENS=1.
+// VLLM_USE_FASTOKENS=1 (unless disableFastokens is true).
 // OMP_NUM_THREADS=8 allows each GPU worker to spread PyTorch CPU ops (input
 // tensor prep, attention assembly, sampling, KV cache) across multiple cores.
 // VLLM_CPU_OMP_THREADS_BIND=auto lets vLLM pin those threads to cores local to
@@ -121,8 +121,10 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 // LD_PRELOAD replaces glibc malloc with tcmalloc's per-thread cache allocator,
 // reducing lock contention under multi-threaded CPU load.
 // VLLM_USE_FASTOKENS=1 enables the Rust BPE tokenizer backend for all BPE
-// models (Qwen, DeepSeek, etc.), reducing tokenization overhead.
-func buildEnv(cudaVisible string) []string {
+// models (Qwen, DeepSeek, etc.), reducing tokenization overhead. Disable for
+// models with WordLevel tokenizers (e.g. surya-ocr-2) that the Rust backend
+// doesn't support.
+func buildEnv(cudaVisible string, disableFastokens bool) []string {
 	base := os.Environ()
 	out := make([]string, 0, len(base)+7)
 	for _, kv := range base {
@@ -142,8 +144,10 @@ func buildEnv(cudaVisible string) []string {
 		"OMP_NUM_THREADS=8",
 		"VLLM_CPU_OMP_THREADS_BIND=auto",
 		"LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
-		"VLLM_USE_FASTOKENS=1",
 	)
+	if !disableFastokens {
+		out = append(out, "VLLM_USE_FASTOKENS=1")
+	}
 	return out
 }
 

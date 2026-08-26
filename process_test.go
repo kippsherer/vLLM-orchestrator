@@ -32,7 +32,7 @@ func TestBuildEnv(t *testing.T) {
 		os.Unsetenv("VLLM_USE_FASTOKENS")
 	})
 
-	result := buildEnv("0,1")
+	result := buildEnv("0,1", false)
 
 	var cudaVal, devModeVal, ompVal, ldPreloadVal, fasttokensVal string
 	cudaCount, devModeCount, ompCount, ldPreloadCount, fasttokensCount := 0, 0, 0, 0, 0
@@ -87,6 +87,25 @@ func TestBuildEnv(t *testing.T) {
 	}
 	if fasttokensVal != "1" {
 		t.Errorf("VLLM_USE_FASTOKENS = %q, want %q (parent value must be overridden)", fasttokensVal, "1")
+	}
+}
+
+func TestBuildEnvDisableFastokens(t *testing.T) {
+	t.Parallel()
+
+	os.Setenv("VLLM_USE_FASTOKENS", "old")
+	t.Cleanup(func() { os.Unsetenv("VLLM_USE_FASTOKENS") })
+
+	result := buildEnv("0", true)
+
+	fasttokensCount := 0
+	for _, kv := range result {
+		if strings.HasPrefix(kv, "VLLM_USE_FASTOKENS=") {
+			fasttokensCount++
+		}
+	}
+	if fasttokensCount != 0 {
+		t.Errorf("VLLM_USE_FASTOKENS appears %d times, want 0 (disabled)", fasttokensCount)
 	}
 }
 

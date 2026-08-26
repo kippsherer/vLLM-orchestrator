@@ -49,6 +49,7 @@ type ModelConfig struct {
 	TTLUnused          time.Duration `yaml:"ttl_unused"`           // overrides global ttl_unused when > 0
 	VLLMArgs           []string      `yaml:"vllm_args"`            // vLLM only
 	TensorParallelSize int           `yaml:"tensor_parallel_size"` // vLLM only; 0 = auto (defaults to len(group.gpus)); overrides when > 0
+	DisableFastokens   bool          `yaml:"disable_fastokens"`    // vLLM only; when true, skip VLLM_USE_FASTOKENS=1 (needed for WordLevel tokenizers)
 	GGUFPath           string        `yaml:"gguf_path"`            // llama_cpp only; joined with llama_cpp_model_dir
 	LlamaCppArgs       []string      `yaml:"llama_cpp_args"`       // llama_cpp only; raw passthrough
 }
