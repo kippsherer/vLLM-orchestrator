@@ -764,3 +764,129 @@ func TestRule1LlamaCppSkippedWithActiveReqs(t *testing.T) {
 		t.Error("proc should not be nil (model was not evicted)")
 	}
 }
+
+// makePinnedOrchestrator builds an orchestrator with two models pinned to the
+// same single-GPU group, for exercising the co-residency gate in assignGroup.
+func makePinnedOrchestrator(t *testing.T, modelA ModelConfig, modelB ModelConfig) *orchestrator {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := &Config{
+		Listen:        ":9999",
+		VLLMSocketDir: dir,
+		QueueDepth:    4,
+		TTLActive:     5 * time.Minute,
+		TTLInactive:   30 * time.Minute,
+		TTLUnused:     60 * time.Minute,
+		GPUGroups:     []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models:        []ModelConfig{modelA, modelB},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: -1},
+		},
+		freeCPURAMB: 65536,
+	}
+	return newOrchestrator(cfg, ms)
+}
+
+func TestAssignGroupPinnedCoResidency(t *testing.T) {
+	t.Parallel()
+
+	o := makePinnedOrchestrator(t,
+		ModelConfig{Name: "model-a", GPUGroup: "g0", VRAMAllocationMB: 12000},
+		ModelConfig{Name: "model-b", GPUGroup: "g0", VRAMAllocationMB: 9000},
+	)
+
+	// model-a is ACTIVE and already assigned to g0, occupying 12000 MB.
+	a := o.models[0]
+	a.mu.Lock()
+	a.state = stateActive
+	a.assignedGroupIdx = 0
+	a.reservedVRAMMB = 12000
+	a.mu.Unlock()
+
+	// nvidia-smi reports 24576 - 12000 = 12576 MB free: enough for model-b's
+	// 9000 MB reservation, so model-a must NOT be evicted.
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() {
+		queryNvidiaSmiFreeMB = origSmi
+		readMemAvailableMB = origMem
+	})
+	queryNvidiaSmiFreeMB = func() (string, error) { return "0, 12576", nil }
+	readMemAvailableMB = func() (int64, error) { return 65536, nil }
+
+	b := o.models[1]
+	idx, err := o.assignGroup(b)
+	if err != nil {
+		t.Fatalf("assignGroup: %v", err)
+	}
+	if idx != 0 {
+		t.Errorf("assignGroup returned idx %d, want 0", idx)
+	}
+
+	a.mu.Lock()
+	st := a.state
+	a.mu.Unlock()
+	if st != stateActive {
+		t.Errorf("model-a state = %s, want active (co-residency: must not be evicted)", st)
+	}
+}
+
+func TestAssignGroupPinnedEvictsWhenInsufficientFree(t *testing.T) {
+	t.Parallel()
+
+	o := makePinnedOrchestrator(t,
+		ModelConfig{Name: "model-a", Engine: engineLlamaCpp, GPUGroup: "g0", VRAMAllocationMB: 22000},
+		ModelConfig{Name: "model-b", GPUGroup: "g0", VRAMAllocationMB: 9000},
+	)
+
+	// model-a (llama_cpp) is ACTIVE and assigned to g0, occupying 22000 MB.
+	a := o.models[0]
+	a.mu.Lock()
+	a.state = stateActive
+	a.assignedGroupIdx = 0
+	a.reservedVRAMMB = 22000
+	a.mem.fullKVVRAMMB = 22000
+	a.proc = &vllmProcess{cmd: &exec.Cmd{}, socketPath: t.TempDir() + "/dummy.sock"}
+	a.mu.Unlock()
+
+	// First nvidia-smi read (the gate check) reports 24576 - 22000 = 2576 MB
+	// free: insufficient for model-b's 9000 MB, so model-a must be evicted.
+	// Subsequent reads (post-eviction) report the reclaimed 25000 MB.
+	calls := 0
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() {
+		queryNvidiaSmiFreeMB = origSmi
+		readMemAvailableMB = origMem
+	})
+	queryNvidiaSmiFreeMB = func() (string, error) {
+		calls++
+		if calls == 1 {
+			return "0, 2576", nil
+		}
+		return "0, 25000", nil
+	}
+	readMemAvailableMB = func() (int64, error) { return 65536, nil }
+
+	b := o.models[1]
+	idx, err := o.assignGroup(b)
+	if err != nil {
+		t.Fatalf("assignGroup: %v", err)
+	}
+	if idx != 0 {
+		t.Errorf("assignGroup returned idx %d, want 0", idx)
+	}
+
+	a.mu.Lock()
+	st := a.state
+	p := a.proc
+	a.mu.Unlock()
+	if st != stateUnloaded {
+		t.Errorf("model-a state = %s, want unloaded (insufficient free VRAM must evict)", st)
+	}
+	if p != nil {
+		t.Error("model-a proc should be nil after eviction")
+	}
+}

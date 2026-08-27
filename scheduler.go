@@ -16,7 +16,16 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	if me.cfg.GPUGroup != "" {
 		for i, gs := range o.ms.groups {
 			if gs.id == me.cfg.GPUGroup {
-				if o.groupHasOtherModels(i, me) {
+				// Co-residency: only evict other models on this group when the
+				// actual free VRAM (fresh from nvidia-smi) is insufficient for
+				// this model's reservation. When the group has enough headroom,
+				// leave existing models ACTIVE so multiple small models can
+				// share one GPU simultaneously.
+				refreshMemory(o.ms)
+				o.ms.mu.RLock()
+				free := gs.measuredFreeMB
+				o.ms.mu.RUnlock()
+				if o.groupHasOtherModels(i, me) && free < me.cfg.VRAMAllocationMB {
 					o.freeMemoryRules(gs, me.cfg.VRAMAllocationMB)
 				}
 				refreshMemory(o.ms)
