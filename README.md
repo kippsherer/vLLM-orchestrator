@@ -163,6 +163,7 @@ models:
 - `aliases` are additional names clients may use in the `"model"` field. `/v1/models` always returns the canonical name.
 - `load_at_startup` is optional (default `false`). When `true`, the model begins loading when the orchestrator starts.
 - `gpu_group` (optional) pins the model to the named GPU group, bypassing the automatic smallest-fit scheduler entirely. The named group must exist in `gpu_groups`. When unset, the scheduler assigns the model to the smallest group that has sufficient free VRAM.
+- `replicas` (optional, default `1`) spawns N identical instances of the model, each placed on a distinct GPU group, with requests round-robined across them. Use this for data-parallel throughput scaling of small models (e.g. OCR/embedding models that fit on one GPU). Cannot be combined with `gpu_group`; declare one single-GPU group per replica instead.
 - `ttl_active`, `ttl_inactive`, `ttl_unused` (optional) override the global TTL values for this model individually. Any combination may be set; omitted values fall back to the global setting. The effective values must satisfy `ttl_active < ttl_inactive < ttl_unused` — startup aborts if violated.
 - `vllm_args` are appended to `vllm serve <model_name>` verbatim. **Do not include** `--uds`, `--tensor-parallel-size`, `--gpu-memory-utilization`, or `CUDA_VISIBLE_DEVICES` — these are injected automatically.
 

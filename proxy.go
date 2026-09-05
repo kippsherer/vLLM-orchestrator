@@ -61,12 +61,12 @@ func (o *orchestrator) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request: ?model= required for /metrics", http.StatusBadRequest)
 			return
 		}
-		me := o.resolve(modelParam)
-		if me == nil {
+		rs := o.resolve(modelParam)
+		if rs == nil {
 			http.Error(w, "model not found", http.StatusNotFound)
 			return
 		}
-		o.forwardDirect(w, r, me)
+		o.forwardDirect(w, r, rs.pick())
 		return
 	}
 
@@ -84,12 +84,12 @@ func (o *orchestrator) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "bad request: ?model= required", http.StatusBadRequest)
 			return
 		}
-		me := o.resolve(modelParam)
-		if me == nil {
+		rs := o.resolve(modelParam)
+		if rs == nil {
 			http.Error(w, "model not found", http.StatusNotFound)
 			return
 		}
-		o.routeRequest(w, r, me)
+		o.routeRequest(w, r, rs.pick())
 		return
 	}
 
@@ -114,11 +114,12 @@ func (o *orchestrator) peekAndResolve(w http.ResponseWriter, r *http.Request) (*
 		http.Error(w, "bad request: could not extract model field", http.StatusBadRequest)
 		return nil, nil, false
 	}
-	me := o.resolve(modelName)
-	if me == nil {
+	rs := o.resolve(modelName)
+	if rs == nil {
 		http.Error(w, "model not found", http.StatusNotFound)
 		return nil, nil, false
 	}
+	me := rs.pick()
 	if modelName != me.cfg.Name {
 		buf = rewriteModelField(buf, me.cfg.Name)
 	}

@@ -57,14 +57,29 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 		needed = int64(float64(smallest) * 0.85)
 	}
 
+	// Serialize group assignment across replicas of the same model so each
+	// lands on a distinct group. The exclude set is computed and the chosen
+	// group recorded (assignedGroupIdx) while holding assignMu, closing the
+	// race where two replicas load concurrently and both pick the same group.
+	if me.replicaSet != nil && len(me.replicaSet.entries) > 1 {
+		me.replicaSet.assignMu.Lock()
+		defer me.replicaSet.assignMu.Unlock()
+	}
+	exclude := o.siblingGroups(me)
+
 	// Run freeing rules on any group that has other models assigned to it,
 	// regardless of what nvidia-smi currently reports as free. A model in
 	// SLEEP1 has its weights offloaded but its KV cache still allocated on
 	// the GPU — nvidia-smi correctly shows that KV memory as used, but the
 	// margin may be thin enough that pickGroup passes while the actual
 	// per-device headroom is insufficient for the incoming model to start.
-	// Evicting first guarantees a clean GPU before launch.
+	// Evicting first guarantees a clean GPU before launch. Sibling-occupied
+	// groups are skipped: replicas coexist on distinct groups and must never
+	// be evicted to make room for one another.
 	for i, gs := range o.ms.groups {
+		if exclude != nil && exclude[i] {
+			continue
+		}
 		if gs.measuredTotalVRAMMB < needed {
 			continue
 		}
@@ -76,7 +91,7 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 	refreshMemory(o.ms)
 
 	o.ms.mu.Lock()
-	idx, err := o.pickGroup(needed)
+	idx, err := o.pickGroup(needed, exclude)
 	o.ms.mu.Unlock()
 
 	if err != nil {
@@ -96,6 +111,9 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 		}
 		var candidates []candidateGroup
 		for i, gs := range o.ms.groups {
+			if exclude != nil && exclude[i] {
+				continue
+			}
 			if gs.measuredTotalVRAMMB >= needed {
 				candidates = append(candidates, candidateGroup{i, gs})
 			}
@@ -118,6 +136,9 @@ func (o *orchestrator) assignGroup(me *modelEntry) (int, error) {
 		}
 	}
 
+	me.mu.Lock()
+	me.assignedGroupIdx = idx
+	me.mu.Unlock()
 	me.reservedVRAMMB = needed
 	return idx, nil
 }
@@ -139,12 +160,15 @@ func (o *orchestrator) groupHasOtherModels(groupIdx int, exclude *modelEntry) bo
 	return false
 }
 
-// pickGroup finds the qualifying group with the smallest measuredTotalVRAMMB.
-// Must be called with ms.mu held.
-func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
+// pickGroup finds the qualifying group with the smallest measuredTotalVRAMMB,
+// skipping any group index present in exclude. Must be called with ms.mu held.
+func (o *orchestrator) pickGroup(neededMB int64, exclude map[int]bool) (int, error) {
 	best := -1
 	var bestTotal int64
 	for i, gs := range o.ms.groups {
+		if exclude != nil && exclude[i] {
+			continue
+		}
 		if gs.measuredFreeMB >= neededMB {
 			if best < 0 || gs.measuredTotalVRAMMB < bestTotal {
 				best = i
@@ -156,6 +180,28 @@ func (o *orchestrator) pickGroup(neededMB int64) (int, error) {
 		return -1, fmt.Errorf("no GPU group has %d MB free VRAM", neededMB)
 	}
 	return best, nil
+}
+
+// siblingGroups returns the set of group indices already assigned to other
+// replicas of me's replicaSet, so a replica never lands on a sibling's group.
+// Returns nil when me is not replicated.
+func (o *orchestrator) siblingGroups(me *modelEntry) map[int]bool {
+	if me.replicaSet == nil || len(me.replicaSet.entries) <= 1 {
+		return nil
+	}
+	exclude := make(map[int]bool)
+	for _, sib := range me.replicaSet.entries {
+		if sib == me {
+			continue
+		}
+		sib.mu.Lock()
+		g := sib.assignedGroupIdx
+		sib.mu.Unlock()
+		if g >= 0 {
+			exclude[g] = true
+		}
+	}
+	return exclude
 }
 
 // freeMemoryRules applies the four eviction rules to a single GPU group gs.

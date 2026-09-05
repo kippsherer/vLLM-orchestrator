@@ -88,13 +88,13 @@ func TestNewOrchestratorLlamaCppSocketDir(t *testing.T) {
 	}
 
 	// vLLM model socket should be in VLLMSocketDir.
-	vllmMe := o.resolve("vllm-model")
+	vllmMe := o.resolve("vllm-model").pick()
 	if !strings.HasPrefix(vllmMe.socketPath, vllmDir) {
 		t.Errorf("vLLM model socketPath = %q, want prefix %q", vllmMe.socketPath, vllmDir)
 	}
 
 	// llama_cpp model socket should be in LlamaCppSocketDir.
-	llamaMe := o.resolve("llama-model")
+	llamaMe := o.resolve("llama-model").pick()
 	if !strings.HasPrefix(llamaMe.socketPath, llamaCppDir) {
 		t.Errorf("llama_cpp model socketPath = %q, want prefix %q", llamaMe.socketPath, llamaCppDir)
 	}
@@ -119,15 +119,92 @@ func TestResolve(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			me := o.resolve(tc.name)
-			if tc.found && me == nil {
+			rs := o.resolve(tc.name)
+			if tc.found && rs == nil {
 				t.Errorf("resolve(%q) = nil, want non-nil", tc.name)
 			}
-			if !tc.found && me != nil {
-				t.Errorf("resolve(%q) = %v, want nil", tc.name, me)
+			if !tc.found && rs != nil {
+				t.Errorf("resolve(%q) = %v, want nil", tc.name, rs)
 			}
 		})
 	}
+}
+
+func TestNewOrchestratorReplicas(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfg := &Config{
+		Listen:        ":9999",
+		VLLMSocketDir: dir,
+		QueueDepth:    4,
+		TTLActive:     5 * time.Minute,
+		TTLInactive:   30 * time.Minute,
+		TTLUnused:     60 * time.Minute,
+		GPUGroups:     []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models: []ModelConfig{
+			{Name: "surya", Aliases: []string{"s"}, Replicas: 5},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: -1},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+
+	if len(o.models) != 5 {
+		t.Fatalf("got %d models, want 5", len(o.models))
+	}
+	seen := map[string]bool{}
+	for _, me := range o.models {
+		if seen[me.socketPath] {
+			t.Errorf("duplicate socketPath %q", me.socketPath)
+		}
+		seen[me.socketPath] = true
+		if me.replicaSet == nil {
+			t.Error("replicaSet is nil for replicated model")
+		}
+	}
+	for _, name := range []string{"surya", "s"} {
+		rs := o.resolve(name)
+		if rs == nil {
+			t.Fatalf("resolve(%q) = nil", name)
+		}
+		if len(rs.entries) != 5 {
+			t.Errorf("resolve(%q) has %d entries, want 5", name, len(rs.entries))
+		}
+	}
+}
+
+func TestReplicaSetPick(t *testing.T) {
+	t.Parallel()
+
+	t.Run("round_robin", func(t *testing.T) {
+		t.Parallel()
+		rs := &replicaSet{
+			entries: []*modelEntry{
+				{cfg: ModelConfig{Name: "m"}},
+				{cfg: ModelConfig{Name: "m"}},
+				{cfg: ModelConfig{Name: "m"}},
+			},
+		}
+		for i := 0; i < 6; i++ {
+			if got := rs.pick(); got != rs.entries[i%3] {
+				t.Fatalf("pick[%d] = %p, want entries[%d]", i, got, i%3)
+			}
+		}
+	})
+
+	t.Run("single_entry", func(t *testing.T) {
+		t.Parallel()
+		rs := &replicaSet{entries: []*modelEntry{{cfg: ModelConfig{Name: "m"}}}}
+		for i := 0; i < 3; i++ {
+			if rs.pick() != rs.entries[0] {
+				t.Fatal("single-entry set should always return the same entry")
+			}
+		}
+	})
 }
 
 func TestCompleteRequest(t *testing.T) {

@@ -50,6 +50,7 @@ type ModelConfig struct {
 	VLLMArgs           []string      `yaml:"vllm_args"`            // vLLM only
 	TensorParallelSize int           `yaml:"tensor_parallel_size"` // vLLM only; 0 = auto (defaults to len(group.gpus)); overrides when > 0
 	DisableFastokens   bool          `yaml:"disable_fastokens"`    // vLLM only; when true, skip VLLM_USE_FASTOKENS=1 (needed for WordLevel tokenizers)
+	Replicas           int           `yaml:"replicas"`             // number of identical instances; 0/1 = single instance. >1 spawns N processes, one per distinct GPU group, with round-robin routing
 	GGUFPath           string        `yaml:"gguf_path"`            // llama_cpp only; joined with llama_cpp_model_dir
 	LlamaCppArgs       []string      `yaml:"llama_cpp_args"`       // llama_cpp only; raw passthrough
 }
@@ -153,6 +154,15 @@ func validateConfig(cfg *Config) error {
 		// TensorParallelSize must be >= 0; not allowed on llama_cpp models.
 		if m.TensorParallelSize < 0 {
 			return fmt.Errorf("config: model %q: tensor_parallel_size must be >= 0", m.Name)
+		}
+		// Replicas must be >= 0 (0 = single instance). Replicas > 1 cannot be
+		// combined with a gpu_group pin: the pin would force every replica onto
+		// the same group, defeating data-parallel placement across distinct GPUs.
+		if m.Replicas < 0 {
+			return fmt.Errorf("config: model %q: replicas must be >= 0", m.Name)
+		}
+		if m.Replicas > 1 && m.GPUGroup != "" {
+			return fmt.Errorf("config: model %q: replicas > 1 cannot be combined with gpu_group pinning", m.Name)
 		}
 		// Engine validation.
 		switch m.Engine {

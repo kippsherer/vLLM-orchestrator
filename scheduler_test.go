@@ -89,7 +89,7 @@ func TestPickGroup(t *testing.T) {
 
 			// pickGroup requires ms.mu held; lock it for the call.
 			ms.mu.Lock()
-			idx, err := o.pickGroup(tc.neededMB)
+			idx, err := o.pickGroup(tc.neededMB, nil)
 			ms.mu.Unlock()
 
 			if tc.wantErr {
@@ -105,6 +105,111 @@ func TestPickGroup(t *testing.T) {
 				t.Errorf("pickGroup returned idx %d, want %d", idx, tc.wantIdx)
 			}
 		})
+	}
+}
+
+func TestPickGroupExclude(t *testing.T) {
+	t.Parallel()
+
+	groups := []*groupState{
+		{id: "g0", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+		{id: "g1", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+		{id: "g2", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+	}
+	ms := &memoryState{groups: groups}
+	o := &orchestrator{ms: ms}
+
+	ms.mu.Lock()
+	idx, err := o.pickGroup(8000, map[int]bool{0: true})
+	ms.mu.Unlock()
+	if err != nil {
+		t.Fatalf("pickGroup: %v", err)
+	}
+	if idx != 1 {
+		t.Errorf("pickGroup with group 0 excluded returned %d, want 1", idx)
+	}
+}
+
+func TestSiblingGroups(t *testing.T) {
+	t.Parallel()
+
+	rs := &replicaSet{}
+	entries := make([]*modelEntry, 3)
+	for i := range entries {
+		entries[i] = &modelEntry{replicaSet: rs, assignedGroupIdx: -1}
+		rs.entries = append(rs.entries, entries[i])
+	}
+	// Siblings 0 and 2 occupy groups 0 and 2 respectively.
+	entries[0].assignedGroupIdx = 0
+	entries[2].assignedGroupIdx = 2
+
+	o := &orchestrator{}
+	exclude := o.siblingGroups(entries[1])
+	if len(exclude) != 2 || !exclude[0] || !exclude[2] {
+		t.Errorf("siblingGroups = %v, want {0:true, 2:true}", exclude)
+	}
+
+	// Non-replicated entry returns nil.
+	o2 := &orchestrator{}
+	if got := o2.siblingGroups(&modelEntry{}); got != nil {
+		t.Errorf("siblingGroups for non-replicated entry = %v, want nil", got)
+	}
+}
+
+func TestAssignGroupReplicasDistinctGroups(t *testing.T) {
+	// Not t.Parallel: mocks the global nvidia-smi/meminfo vars, which parallel
+	// tests in this package also mutate.
+	dir := t.TempDir()
+	cfg := &Config{
+		Listen:        ":9999",
+		VLLMSocketDir: dir,
+		QueueDepth:    4,
+		TTLActive:     5 * time.Minute,
+		TTLInactive:   30 * time.Minute,
+		TTLUnused:     60 * time.Minute,
+		GPUGroups: []GPUGroup{
+			{ID: "g0", GPUs: []int{0}},
+			{ID: "g1", GPUs: []int{1}},
+			{ID: "g2", GPUs: []int{2}},
+		},
+		Models: []ModelConfig{
+			{Name: "surya", Replicas: 3, VRAMAllocationMB: 22000},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+			{id: "g1", gpus: []int{1}, measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+			{id: "g2", gpus: []int{2}, measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() {
+		queryNvidiaSmiFreeMB = origSmi
+		readMemAvailableMB = origMem
+	})
+	queryNvidiaSmiFreeMB = func() (string, error) {
+		return "0, 24576\n1, 24576\n2, 24576", nil
+	}
+	readMemAvailableMB = func() (int64, error) { return 65536, nil }
+
+	assigned := map[int]bool{}
+	for _, me := range o.models {
+		idx, err := o.assignGroup(me)
+		if err != nil {
+			t.Fatalf("assignGroup: %v", err)
+		}
+		if assigned[idx] {
+			t.Errorf("replica assigned to already-used group %d", idx)
+		}
+		assigned[idx] = true
+	}
+	if len(assigned) != 3 {
+		t.Errorf("expected 3 distinct groups, got %d", len(assigned))
 	}
 }
 
