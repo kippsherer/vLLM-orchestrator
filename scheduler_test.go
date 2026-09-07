@@ -89,7 +89,7 @@ func TestPickGroup(t *testing.T) {
 
 			// pickGroup requires ms.mu held; lock it for the call.
 			ms.mu.Lock()
-			idx, err := o.pickGroup(tc.neededMB)
+			idx, err := o.pickGroup(tc.neededMB, nil)
 			ms.mu.Unlock()
 
 			if tc.wantErr {
@@ -105,6 +105,111 @@ func TestPickGroup(t *testing.T) {
 				t.Errorf("pickGroup returned idx %d, want %d", idx, tc.wantIdx)
 			}
 		})
+	}
+}
+
+func TestPickGroupExclude(t *testing.T) {
+	t.Parallel()
+
+	groups := []*groupState{
+		{id: "g0", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+		{id: "g1", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+		{id: "g2", measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+	}
+	ms := &memoryState{groups: groups}
+	o := &orchestrator{ms: ms}
+
+	ms.mu.Lock()
+	idx, err := o.pickGroup(8000, map[int]bool{0: true})
+	ms.mu.Unlock()
+	if err != nil {
+		t.Fatalf("pickGroup: %v", err)
+	}
+	if idx != 1 {
+		t.Errorf("pickGroup with group 0 excluded returned %d, want 1", idx)
+	}
+}
+
+func TestSiblingGroups(t *testing.T) {
+	t.Parallel()
+
+	rs := &replicaSet{}
+	entries := make([]*modelEntry, 3)
+	for i := range entries {
+		entries[i] = &modelEntry{replicaSet: rs, assignedGroupIdx: -1}
+		rs.entries = append(rs.entries, entries[i])
+	}
+	// Siblings 0 and 2 occupy groups 0 and 2 respectively.
+	entries[0].assignedGroupIdx = 0
+	entries[2].assignedGroupIdx = 2
+
+	o := &orchestrator{}
+	exclude := o.siblingGroups(entries[1])
+	if len(exclude) != 2 || !exclude[0] || !exclude[2] {
+		t.Errorf("siblingGroups = %v, want {0:true, 2:true}", exclude)
+	}
+
+	// Non-replicated entry returns nil.
+	o2 := &orchestrator{}
+	if got := o2.siblingGroups(&modelEntry{}); got != nil {
+		t.Errorf("siblingGroups for non-replicated entry = %v, want nil", got)
+	}
+}
+
+func TestAssignGroupReplicasDistinctGroups(t *testing.T) {
+	// Not t.Parallel: mocks the global nvidia-smi/meminfo vars, which parallel
+	// tests in this package also mutate.
+	dir := t.TempDir()
+	cfg := &Config{
+		Listen:        ":9999",
+		VLLMSocketDir: dir,
+		QueueDepth:    4,
+		TTLActive:     5 * time.Minute,
+		TTLInactive:   30 * time.Minute,
+		TTLUnused:     60 * time.Minute,
+		GPUGroups: []GPUGroup{
+			{ID: "g0", GPUs: []int{0}},
+			{ID: "g1", GPUs: []int{1}},
+			{ID: "g2", GPUs: []int{2}},
+		},
+		Models: []ModelConfig{
+			{Name: "surya", Replicas: 3, VRAMAllocationMB: 22000},
+		},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+			{id: "g1", gpus: []int{1}, measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+			{id: "g2", gpus: []int{2}, measuredTotalVRAMMB: 24576, measuredFreeMB: 24576},
+		},
+		freeCPURAMB: 65536,
+	}
+	o := newOrchestrator(cfg, ms)
+
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() {
+		queryNvidiaSmiFreeMB = origSmi
+		readMemAvailableMB = origMem
+	})
+	queryNvidiaSmiFreeMB = func() (string, error) {
+		return "0, 24576\n1, 24576\n2, 24576", nil
+	}
+	readMemAvailableMB = func() (int64, error) { return 65536, nil }
+
+	assigned := map[int]bool{}
+	for _, me := range o.models {
+		idx, err := o.assignGroup(me)
+		if err != nil {
+			t.Fatalf("assignGroup: %v", err)
+		}
+		if assigned[idx] {
+			t.Errorf("replica assigned to already-used group %d", idx)
+		}
+		assigned[idx] = true
+	}
+	if len(assigned) != 3 {
+		t.Errorf("expected 3 distinct groups, got %d", len(assigned))
 	}
 }
 
@@ -762,5 +867,131 @@ func TestRule1LlamaCppSkippedWithActiveReqs(t *testing.T) {
 	}
 	if p == nil {
 		t.Error("proc should not be nil (model was not evicted)")
+	}
+}
+
+// makePinnedOrchestrator builds an orchestrator with two models pinned to the
+// same single-GPU group, for exercising the co-residency gate in assignGroup.
+func makePinnedOrchestrator(t *testing.T, modelA ModelConfig, modelB ModelConfig) *orchestrator {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := &Config{
+		Listen:        ":9999",
+		VLLMSocketDir: dir,
+		QueueDepth:    4,
+		TTLActive:     5 * time.Minute,
+		TTLInactive:   30 * time.Minute,
+		TTLUnused:     60 * time.Minute,
+		GPUGroups:     []GPUGroup{{ID: "g0", GPUs: []int{0}}},
+		Models:        []ModelConfig{modelA, modelB},
+	}
+	ms := &memoryState{
+		groups: []*groupState{
+			{id: "g0", gpus: []int{0}, measuredTotalVRAMMB: 24576, measuredFreeMB: -1},
+		},
+		freeCPURAMB: 65536,
+	}
+	return newOrchestrator(cfg, ms)
+}
+
+func TestAssignGroupPinnedCoResidency(t *testing.T) {
+	t.Parallel()
+
+	o := makePinnedOrchestrator(t,
+		ModelConfig{Name: "model-a", GPUGroup: "g0", VRAMAllocationMB: 12000},
+		ModelConfig{Name: "model-b", GPUGroup: "g0", VRAMAllocationMB: 9000},
+	)
+
+	// model-a is ACTIVE and already assigned to g0, occupying 12000 MB.
+	a := o.models[0]
+	a.mu.Lock()
+	a.state = stateActive
+	a.assignedGroupIdx = 0
+	a.reservedVRAMMB = 12000
+	a.mu.Unlock()
+
+	// nvidia-smi reports 24576 - 12000 = 12576 MB free: enough for model-b's
+	// 9000 MB reservation, so model-a must NOT be evicted.
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() {
+		queryNvidiaSmiFreeMB = origSmi
+		readMemAvailableMB = origMem
+	})
+	queryNvidiaSmiFreeMB = func() (string, error) { return "0, 12576", nil }
+	readMemAvailableMB = func() (int64, error) { return 65536, nil }
+
+	b := o.models[1]
+	idx, err := o.assignGroup(b)
+	if err != nil {
+		t.Fatalf("assignGroup: %v", err)
+	}
+	if idx != 0 {
+		t.Errorf("assignGroup returned idx %d, want 0", idx)
+	}
+
+	a.mu.Lock()
+	st := a.state
+	a.mu.Unlock()
+	if st != stateActive {
+		t.Errorf("model-a state = %s, want active (co-residency: must not be evicted)", st)
+	}
+}
+
+func TestAssignGroupPinnedEvictsWhenInsufficientFree(t *testing.T) {
+	t.Parallel()
+
+	o := makePinnedOrchestrator(t,
+		ModelConfig{Name: "model-a", Engine: engineLlamaCpp, GPUGroup: "g0", VRAMAllocationMB: 22000},
+		ModelConfig{Name: "model-b", GPUGroup: "g0", VRAMAllocationMB: 9000},
+	)
+
+	// model-a (llama_cpp) is ACTIVE and assigned to g0, occupying 22000 MB.
+	a := o.models[0]
+	a.mu.Lock()
+	a.state = stateActive
+	a.assignedGroupIdx = 0
+	a.reservedVRAMMB = 22000
+	a.mem.fullKVVRAMMB = 22000
+	a.proc = &vllmProcess{cmd: &exec.Cmd{}, socketPath: t.TempDir() + "/dummy.sock"}
+	a.mu.Unlock()
+
+	// First nvidia-smi read (the gate check) reports 24576 - 22000 = 2576 MB
+	// free: insufficient for model-b's 9000 MB, so model-a must be evicted.
+	// Subsequent reads (post-eviction) report the reclaimed 25000 MB.
+	calls := 0
+	origSmi := queryNvidiaSmiFreeMB
+	origMem := readMemAvailableMB
+	t.Cleanup(func() {
+		queryNvidiaSmiFreeMB = origSmi
+		readMemAvailableMB = origMem
+	})
+	queryNvidiaSmiFreeMB = func() (string, error) {
+		calls++
+		if calls == 1 {
+			return "0, 2576", nil
+		}
+		return "0, 25000", nil
+	}
+	readMemAvailableMB = func() (int64, error) { return 65536, nil }
+
+	b := o.models[1]
+	idx, err := o.assignGroup(b)
+	if err != nil {
+		t.Fatalf("assignGroup: %v", err)
+	}
+	if idx != 0 {
+		t.Errorf("assignGroup returned idx %d, want 0", idx)
+	}
+
+	a.mu.Lock()
+	st := a.state
+	p := a.proc
+	a.mu.Unlock()
+	if st != stateUnloaded {
+		t.Errorf("model-a state = %s, want unloaded (insufficient free VRAM must evict)", st)
+	}
+	if p != nil {
+		t.Error("model-a proc should be nil after eviction")
 	}
 }

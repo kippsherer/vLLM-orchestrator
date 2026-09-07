@@ -4,7 +4,9 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -60,6 +62,26 @@ type modelEntry struct {
 	lastCompleted    time.Time
 	assignedGroupIdx int   // index into memoryState.groups; -1 if unassigned
 	reservedVRAMMB   int64 // VRAM MB reserved at launch time (placeholder or actual)
+	replicaSet       *replicaSet
+}
+
+// replicaSet groups the N modelEntry instances of a replicated model and owns
+// the round-robin cursor plus a mutex serializing group assignment so siblings
+// land on distinct GPU groups.
+type replicaSet struct {
+	entries  []*modelEntry
+	next     atomic.Uint64
+	assignMu sync.Mutex
+}
+
+// pick returns the next entry in round-robin order. Single-entry sets always
+// return that entry without touching the counter.
+func (rs *replicaSet) pick() *modelEntry {
+	if len(rs.entries) == 1 {
+		return rs.entries[0]
+	}
+	n := rs.next.Add(1) - 1
+	return rs.entries[n%uint64(len(rs.entries))]
 }
 
 // orchestrator is the top-level runtime that owns all model entries and memory.
@@ -67,8 +89,8 @@ type orchestrator struct {
 	cfg    *Config
 	ms     *memoryState
 	models []*modelEntry
-	// modelByName maps canonical name and aliases → *modelEntry
-	modelByName map[string]*modelEntry
+	// modelByName maps canonical name and aliases → *replicaSet
+	modelByName map[string]*replicaSet
 }
 
 // newOrchestrator constructs the orchestrator from config and memory state.
@@ -76,32 +98,45 @@ func newOrchestrator(cfg *Config, ms *memoryState) *orchestrator {
 	o := &orchestrator{
 		cfg:         cfg,
 		ms:          ms,
-		modelByName: make(map[string]*modelEntry),
+		modelByName: make(map[string]*replicaSet),
 	}
 	for _, mc := range cfg.Models {
 		socketDir := cfg.VLLMSocketDir
 		if mc.Engine == engineLlamaCpp {
 			socketDir = cfg.LlamaCppSocketDir
 		}
-		me := &modelEntry{
-			cfg:              mc,
-			socketPath:       socketDir + "/" + sanitizeModelName(mc.Name) + ".sock",
-			state:            stateUnloaded,
-			queue:            make(chan requestPair, cfg.QueueDepth),
-			lastCompleted:    time.Now(),
-			assignedGroupIdx: -1,
+		n := mc.Replicas
+		if n <= 0 {
+			n = 1
 		}
-		o.models = append(o.models, me)
-		o.modelByName[mc.Name] = me
+		rs := &replicaSet{}
+		for i := 0; i < n; i++ {
+			sockName := sanitizeModelName(mc.Name)
+			if n > 1 {
+				sockName += "-" + strconv.Itoa(i)
+			}
+			me := &modelEntry{
+				cfg:              mc,
+				socketPath:       socketDir + "/" + sockName + ".sock",
+				state:            stateUnloaded,
+				queue:            make(chan requestPair, cfg.QueueDepth),
+				lastCompleted:    time.Now(),
+				assignedGroupIdx: -1,
+				replicaSet:       rs,
+			}
+			o.models = append(o.models, me)
+			rs.entries = append(rs.entries, me)
+		}
+		o.modelByName[mc.Name] = rs
 		for _, a := range mc.Aliases {
-			o.modelByName[a] = me
+			o.modelByName[a] = rs
 		}
 	}
 	return o
 }
 
-// resolve returns the modelEntry for name-or-alias, or nil.
-func (o *orchestrator) resolve(name string) *modelEntry {
+// resolve returns the replicaSet for name-or-alias, or nil.
+func (o *orchestrator) resolve(name string) *replicaSet {
 	return o.modelByName[name]
 }
 

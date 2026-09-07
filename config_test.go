@@ -164,6 +164,15 @@ func TestValidateConfig(t *testing.T) {
 		{"tensor_parallel_size zero defaults to group size", func(c *Config) {
 			c.Models[0].TensorParallelSize = 0
 		}, ""},
+		{"replicas negative", func(c *Config) {
+			c.Models[0].Replicas = -1
+		}, "replicas must be >= 0"},
+		{"replicas with gpu_group", func(c *Config) {
+			c.Models[0] = ModelConfig{Name: "m1", GPUGroup: "g0", Replicas: 2}
+		}, "replicas > 1 cannot be combined"},
+		{"replicas valid", func(c *Config) {
+			c.Models[0].Replicas = 3
+		}, ""},
 	}
 
 	for _, tc := range cases {
