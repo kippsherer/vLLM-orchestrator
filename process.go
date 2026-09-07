@@ -73,7 +73,7 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 	}, memArg...), modelCfg.VLLMArgs...)
 
 	cmd := exec.Command("vllm", args...)
-	cmd.Env = buildEnv(cudaVisible, modelCfg.DisableFastokens)
+	cmd.Env = buildEnv(cudaVisible, modelCfg.DisableFastokens, modelCfg.DisableTcmallocPreload)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -112,14 +112,19 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 
 // buildEnv constructs the subprocess environment from the current env,
 // injecting CUDA_VISIBLE_DEVICES, VLLM_SERVER_DEV_MODE=1, OMP_NUM_THREADS=8,
-// VLLM_CPU_OMP_THREADS_BIND=auto, LD_PRELOAD=libtcmalloc_minimal, and
-// VLLM_USE_FASTOKENS=1 (unless disableFastokens is true).
+// VLLM_CPU_OMP_THREADS_BIND=auto, LD_PRELOAD=libtcmalloc_minimal (unless
+// disableTcmallocPreload is true), and VLLM_USE_FASTOKENS=1 (unless
+// disableFastokens is true).
 // OMP_NUM_THREADS=8 allows each GPU worker to spread PyTorch CPU ops (input
 // tensor prep, attention assembly, sampling, KV cache) across multiple cores.
 // VLLM_CPU_OMP_THREADS_BIND=auto lets vLLM pin those threads to cores local to
 // each worker's GPU NUMA node.
 // LD_PRELOAD replaces glibc malloc with tcmalloc's per-thread cache allocator,
-// reducing lock contention under multi-threaded CPU load.
+// reducing lock contention under multi-threaded CPU load. Disable for models
+// using --numa-bind on hosts where the executable-hijacking re-exec combined
+// with LD_PRELOAD crashes ld.so (general protection fault in
+// ld-linux-x86-64.so.2) — seen on some hosts but not others with identical
+// binaries, likely a driver/glibc-linker interaction.
 // VLLM_USE_FASTOKENS=1 enables the Rust BPE tokenizer backend for all BPE
 // models (Qwen, DeepSeek, etc.), reducing tokenization overhead. Disable for
 // models with WordLevel tokenizers (e.g. surya-ocr-2) that the Rust backend
@@ -128,7 +133,7 @@ func launchVLLM(modelCfg ModelConfig, socketPath string, group *groupState, mem 
 // grow segments contiguously instead of carving fixed blocks, reducing
 // reserved-but-unallocated fragmentation from variable-shape multimodal
 // activation spikes (vision-encoder forwards).
-func buildEnv(cudaVisible string, disableFastokens bool) []string {
+func buildEnv(cudaVisible string, disableFastokens bool, disableTcmallocPreload bool) []string {
 	base := os.Environ()
 	out := make([]string, 0, len(base)+8)
 	for _, kv := range base {
@@ -147,9 +152,11 @@ func buildEnv(cudaVisible string, disableFastokens bool) []string {
 		"VLLM_SERVER_DEV_MODE=1",
 		"OMP_NUM_THREADS=8",
 		"VLLM_CPU_OMP_THREADS_BIND=auto",
-		"LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4",
 		"PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
 	)
+	if !disableTcmallocPreload {
+		out = append(out, "LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4")
+	}
 	if !disableFastokens {
 		out = append(out, "VLLM_USE_FASTOKENS=1")
 	}

@@ -37,21 +37,22 @@ type GPUGroup struct {
 
 // ModelConfig is the per-model entry from the YAML file.
 type ModelConfig struct {
-	Name               string        `yaml:"name"`
-	Aliases            []string      `yaml:"aliases"`
-	Engine             string        `yaml:"engine"` // "" or "vllm" (default) | "llama_cpp"
-	LoadAtStartup      bool          `yaml:"load_at_startup"`
-	GPUGroup           string        `yaml:"gpu_group"`            // when set, pins this model to the named gpu_group
-	VRAMAllocationMB   int64         `yaml:"vram_allocation"`      // authoritative VRAM this model is allowed to consume on the group
-	KVCacheMemoryGB    float64       `yaml:"kv_cache_memory"`      // vLLM only; passed as --kv-cache-memory-bytes (GiB)
-	TTLActive          time.Duration `yaml:"ttl_active"`           // overrides global ttl_active when > 0
-	TTLInactive        time.Duration `yaml:"ttl_inactive"`         // overrides global ttl_inactive when > 0
-	TTLUnused          time.Duration `yaml:"ttl_unused"`           // overrides global ttl_unused when > 0
-	VLLMArgs           []string      `yaml:"vllm_args"`            // vLLM only
-	TensorParallelSize int           `yaml:"tensor_parallel_size"` // vLLM only; 0 = auto (defaults to len(group.gpus)); overrides when > 0
-	DisableFastokens   bool          `yaml:"disable_fastokens"`    // vLLM only; when true, skip VLLM_USE_FASTOKENS=1 (needed for WordLevel tokenizers)
-	GGUFPath           string        `yaml:"gguf_path"`            // llama_cpp only; joined with llama_cpp_model_dir
-	LlamaCppArgs       []string      `yaml:"llama_cpp_args"`       // llama_cpp only; raw passthrough
+	Name                   string        `yaml:"name"`
+	Aliases                []string      `yaml:"aliases"`
+	Engine                 string        `yaml:"engine"` // "" or "vllm" (default) | "llama_cpp"
+	LoadAtStartup          bool          `yaml:"load_at_startup"`
+	GPUGroup               string        `yaml:"gpu_group"`                // when set, pins this model to the named gpu_group
+	VRAMAllocationMB       int64         `yaml:"vram_allocation"`          // authoritative VRAM this model is allowed to consume on the group
+	KVCacheMemoryGB        float64       `yaml:"kv_cache_memory"`          // vLLM only; passed as --kv-cache-memory-bytes (GiB)
+	TTLActive              time.Duration `yaml:"ttl_active"`               // overrides global ttl_active when > 0
+	TTLInactive            time.Duration `yaml:"ttl_inactive"`             // overrides global ttl_inactive when > 0
+	TTLUnused              time.Duration `yaml:"ttl_unused"`               // overrides global ttl_unused when > 0
+	VLLMArgs               []string      `yaml:"vllm_args"`                // vLLM only
+	TensorParallelSize     int           `yaml:"tensor_parallel_size"`     // vLLM only; 0 = auto (defaults to len(group.gpus)); overrides when > 0
+	DisableFastokens       bool          `yaml:"disable_fastokens"`        // vLLM only; when true, skip VLLM_USE_FASTOKENS=1 (needed for WordLevel tokenizers)
+	DisableTcmallocPreload bool          `yaml:"disable_tcmalloc_preload"` // vLLM only; when true, skip LD_PRELOAD=libtcmalloc_minimal injection (needed when combined with --numa-bind causes ld.so crashes on some hosts)
+	GGUFPath               string        `yaml:"gguf_path"`                // llama_cpp only; joined with llama_cpp_model_dir
+	LlamaCppArgs           []string      `yaml:"llama_cpp_args"`           // llama_cpp only; raw passthrough
 }
 
 // loadConfig reads and parses the YAML file at path.

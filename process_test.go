@@ -36,7 +36,7 @@ func TestBuildEnv(t *testing.T) {
 		os.Unsetenv("PYTORCH_CUDA_ALLOC_CONF")
 	})
 
-	result := buildEnv("0,1", false)
+	result := buildEnv("0,1", false, false)
 
 	var cudaVal, devModeVal, ompVal, ldPreloadVal, fasttokensVal, allocConfVal string
 	cudaCount, devModeCount, ompCount, ldPreloadCount, fasttokensCount, allocConfCount := 0, 0, 0, 0, 0, 0
@@ -110,7 +110,7 @@ func TestBuildEnvDisableFastokens(t *testing.T) {
 	os.Setenv("VLLM_USE_FASTOKENS", "old")
 	t.Cleanup(func() { os.Unsetenv("VLLM_USE_FASTOKENS") })
 
-	result := buildEnv("0", true)
+	result := buildEnv("0", true, false)
 
 	fasttokensCount := 0
 	for _, kv := range result {
@@ -120,6 +120,25 @@ func TestBuildEnvDisableFastokens(t *testing.T) {
 	}
 	if fasttokensCount != 0 {
 		t.Errorf("VLLM_USE_FASTOKENS appears %d times, want 0 (disabled)", fasttokensCount)
+	}
+}
+
+func TestBuildEnvDisableTcmallocPreload(t *testing.T) {
+	t.Parallel()
+
+	os.Setenv("LD_PRELOAD", "old")
+	t.Cleanup(func() { os.Unsetenv("LD_PRELOAD") })
+
+	result := buildEnv("0", false, true)
+
+	ldPreloadCount := 0
+	for _, kv := range result {
+		if strings.HasPrefix(kv, "LD_PRELOAD=") {
+			ldPreloadCount++
+		}
+	}
+	if ldPreloadCount != 0 {
+		t.Errorf("LD_PRELOAD appears %d times, want 0 (disabled)", ldPreloadCount)
 	}
 }
 
