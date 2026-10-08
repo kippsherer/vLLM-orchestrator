@@ -33,6 +33,7 @@ go.work.sum
 # Local config (use config.example.yaml as template)
 config.yaml
 config_surya.yaml
+config_parser.yaml
 
 # Agent instructions
 AGENTS.md
