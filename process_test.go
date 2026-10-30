@@ -274,6 +274,41 @@ func TestDrainAndMeasure(t *testing.T) {
 			t.Error("expected measured=false")
 		}
 	})
+
+	// Not parallel: swaps the global log output.
+	t.Run("loguru_traceback_does_not_latch", func(t *testing.T) {
+		var buf bytes.Buffer
+		log.SetOutput(&buf)
+		t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+		pr, pw := io.Pipe()
+		mem := &modelMemory{}
+		done := make(chan struct{})
+		go func() {
+			drainAndMeasure(pr, "test-model", mem)
+			close(done)
+		}()
+		pw.Write([]byte("(APIServer pid=1) ERROR 10-30 02:52:22 [server_utils.py:500] RequestValidationError caught\n"))
+		pw.Write([]byte("(APIServer pid=1) ERROR 10-30 02:52:22 [server_utils.py:500] Traceback (most recent call last):\n"))
+		pw.Write([]byte("(APIServer pid=1) ERROR 10-30 02:52:22 [server_utils.py:500]   File \"server_utils.py\", line 500, in app\n"))
+		pw.Write([]byte("(APIServer pid=1) ERROR 10-30 02:52:22 [server_utils.py:500]\n"))
+		pw.Write([]byte("(APIServer pid=1) INFO:      - \"POST /v1/chat/completions HTTP/1.1\" 400 Bad Request\n"))
+		pw.Write([]byte("(APIServer pid=1) INFO:      - \"GET /health HTTP/1.1\" 200 OK\n"))
+		pw.Close()
+		<-done
+
+		out := buf.String()
+		for _, want := range []string{"RequestValidationError caught", "Traceback (most recent call last)"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("log output missing %q; got: %q", want, out)
+			}
+		}
+		for _, banned := range []string{"chat/completions", "GET /health"} {
+			if strings.Contains(out, banned) {
+				t.Errorf("log output leaked %q; got: %q", banned, out)
+			}
+		}
+	})
 }
 
 func TestPollIsSleeping(t *testing.T) {

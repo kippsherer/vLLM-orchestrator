@@ -256,11 +256,13 @@ func drainAndMeasure(r io.Reader, modelName string, mem *modelMemory) {
 	for sc.Scan() {
 		line := sc.Text()
 		isTracebackStart := strings.Contains(line, "Traceback (most recent call last)")
-		if strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ") || isTracebackStart {
+		marked := strings.Contains(line, "tokens/s") || strings.Contains(line, " WARNING ") || strings.Contains(line, " ERROR ")
+		if marked {
+			inTraceback = false
 			log.Printf("[vllm/%s] %s", modelName, line)
-			if isTracebackStart {
-				inTraceback = true
-			}
+		} else if isTracebackStart {
+			inTraceback = true
+			log.Printf("[vllm/%s] %s", modelName, line)
 		} else if inTraceback {
 			if strings.TrimSpace(line) == "" {
 				inTraceback = false
